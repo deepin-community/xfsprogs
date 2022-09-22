@@ -1,0 +1,28 @@
+Description: add sunway support
+Author: Miao Changwei <miaochangwei@uniontech.com>
+
+---
+Last-Update: 2022-05-15
+
+--- xfsprogs-5.14.0-rc1.orig/io/open.c
++++ xfsprogs-5.14.0-rc1/io/open.c
+@@ -14,8 +14,8 @@
+ #include "libfrog/bulkstat.h"
+ 
+ #ifndef __O_TMPFILE
+-#if defined __alpha__
+-#define __O_TMPFILE	0100000000
++#if defined(__alpha__) || defined(__sw_64__)
++#define __O_TMPFILE	0100100000
+ #elif defined(__hppa__)
+ #define __O_TMPFILE	 040000000
+ #elif defined(__sparc__)
+@@ -30,7 +30,7 @@
+ #endif
+ 
+ #ifndef O_PATH
+-#if defined __alpha__
++#if defined(__alpha__) || defined(__sw_64__)
+ #define O_PATH          040000000
+ #elif defined(__hppa__)
+ #define O_PATH          020000000

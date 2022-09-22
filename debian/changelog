@@ -1,0 +1,11 @@
+xfsprogs (5.16.0.1-deepin) UNRELEASED; urgency=medium
+
+  * update
+
+ -- Deepin Developer <deepin-dev@deepin.org>  Thu, 11 Aug 2022 09:03:54 +0800
+
+xfsprogs (5.16.0.1-deepin) stable; urgency=medium
+
+  * ['Rebuild  against by  current gcc 11.2']
+
+ -- Deepin Packages Builder <packages@deepin.org>  Wed, 10 Aug 2022 21:32:21 +0800
