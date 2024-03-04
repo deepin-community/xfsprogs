@@ -98,7 +98,7 @@ path_navigate(
 
 	for (i = 0; i < dirpath->depth; i++) {
 		struct xfs_name	xname = {
-			.name	= dirpath->path[i],
+			.name	= (unsigned char *)dirpath->path[i],
 			.len	= strlen(dirpath->path[i]),
 		};
 
@@ -250,7 +250,7 @@ dir_emit(
 	uint8_t			dtype)
 {
 	char			*display_name;
-	struct xfs_name		xname = { .name = name };
+	struct xfs_name		xname = { .name = (unsigned char *)name };
 	const char		*dstr = get_dstr(mp, dtype);
 	xfs_dahash_t		hash;
 	bool			good;
@@ -377,7 +377,7 @@ list_leafdir(
 	struct xfs_inode	*dp = args->dp;
 	struct xfs_mount	*mp = dp->i_mount;
 	struct xfs_buf		*bp = NULL;
-	struct xfs_ifork	*ifp = XFS_IFORK_PTR(dp, XFS_DATA_FORK);
+	struct xfs_ifork	*ifp = xfs_ifork_ptr(dp, XFS_DATA_FORK);
 	struct xfs_da_geometry	*geo = mp->m_dir_geo;
 	xfs_dir2_off_t		dirboff;
 	xfs_dablk_t		dabno = 0;
@@ -441,7 +441,7 @@ list_leafdir(
 }
 
 /* Read the directory, display contents. */
-int
+static int
 listdir(
 	struct xfs_inode	*dp)
 {
@@ -450,7 +450,7 @@ listdir(
 		.geo		= dp->i_mount->m_dir_geo,
 	};
 	int			error;
-	int			isblock;
+	bool			isblock;
 
 	if (dp->i_df.if_format == XFS_DINODE_FMT_LOCAL)
 		return list_sfdir(&args);

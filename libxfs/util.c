@@ -28,6 +28,7 @@
 #include "xfs_da_format.h"
 #include "xfs_da_btree.h"
 #include "xfs_dir2_priv.h"
+#include "xfs_health.h"
 
 /*
  * Calculate the worst case log unit reservation for a given superblock
@@ -198,7 +199,8 @@ xfs_flags2diflags2(
 {
 	uint64_t		di_flags2 =
 		(ip->i_diflags2 & (XFS_DIFLAG2_REFLINK |
-				   XFS_DIFLAG2_BIGTIME));
+				   XFS_DIFLAG2_BIGTIME |
+				   XFS_DIFLAG2_NREXT64));
 
 	if (xflags & FS_XFLAG_DAX)
 		di_flags2 |= XFS_DIFLAG2_DAX;
@@ -258,7 +260,7 @@ libxfs_init_new_inode(
 	unsigned int		flags;
 	int			error;
 
-	error = libxfs_iget(tp->t_mountp, tp, ino, 0, &ip);
+	error = libxfs_iget(tp->t_mountp, tp, ino, XFS_IGET_CREATE, &ip);
 	if (error != 0)
 		return error;
 	ASSERT(ip != NULL);
@@ -271,7 +273,8 @@ libxfs_init_new_inode(
 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG | XFS_ICHGTIME_MOD);
 
 	if (pip && (VFS_I(pip)->i_mode & S_ISGID)) {
-		VFS_I(ip)->i_gid = VFS_I(pip)->i_gid;
+		if (!(cr->cr_flags & CRED_FORCE_GID))
+			VFS_I(ip)->i_gid = VFS_I(pip)->i_gid;
 		if ((VFS_I(pip)->i_mode & S_ISGID) && (mode & S_IFMT) == S_IFDIR)
 			VFS_I(ip)->i_mode |= S_ISGID;
 	}
@@ -284,8 +287,10 @@ libxfs_init_new_inode(
 
 	if (xfs_has_v3inodes(ip->i_mount)) {
 		VFS_I(ip)->i_version = 1;
-		ip->i_diflags2 = pip ? ip->i_mount->m_ino_geo.new_diflags2 :
-				xfs_flags2diflags2(ip, fsx->fsx_xflags);
+		ip->i_diflags2 = ip->i_mount->m_ino_geo.new_diflags2;
+		if (!pip)
+			ip->i_diflags2 = xfs_flags2diflags2(ip,
+							fsx->fsx_xflags);
 		ip->i_crtime = VFS_I(ip)->i_mtime; /* struct copy */
 		ip->i_cowextsize = pip ? 0 : fsx->fsx_cowextsize;
 	}
@@ -356,7 +361,7 @@ libxfs_iflush_int(
 			(ip->i_df.if_format == XFS_DINODE_FMT_BTREE)   ||
 			(ip->i_df.if_format == XFS_DINODE_FMT_LOCAL) );
 	}
-	ASSERT(ip->i_df.if_nextents+ip->i_afp->if_nextents <= ip->i_nblocks);
+	ASSERT(ip->i_df.if_nextents+ip.i_af->if_nextents <= ip->i_nblocks);
 	ASSERT(ip->i_forkoff <= mp->m_sb.sb_inodesize);
 
 	/* bump the change count on v3 inodes */
@@ -370,7 +375,8 @@ libxfs_iflush_int(
 	if (ip->i_df.if_format == XFS_DINODE_FMT_LOCAL &&
 	    xfs_ifork_verify_local_data(ip))
 		return -EFSCORRUPTED;
-	if (ip->i_afp && ip->i_afp->if_format == XFS_DINODE_FMT_LOCAL &&
+	if (xfs_inode_has_attr_fork(ip) &&
+	    ip->i_af.if_format == XFS_DINODE_FMT_LOCAL &&
 	    xfs_ifork_verify_local_attr(ip))
 		return -EFSCORRUPTED;
 
@@ -383,7 +389,7 @@ libxfs_iflush_int(
 	xfs_inode_to_disk(ip, dip, iip->ili_item.li_lsn);
 
 	xfs_iflush_fork(ip, dip, iip, XFS_DATA_FORK);
-	if (XFS_IFORK_Q(ip))
+	if (xfs_inode_has_attr_fork(ip))
 		xfs_iflush_fork(ip, dip, iip, XFS_ATTR_FORK);
 
 	/* generate the checksum. */
@@ -637,10 +643,12 @@ void
 xfs_log_item_init(
 	struct xfs_mount	*mp,
 	struct xfs_log_item	*item,
-	int			type)
+	int			type,
+	const struct xfs_item_ops *ops)
 {
 	item->li_mountp = mp; 
 	item->li_type = type;
+	item->li_ops = ops;
 
 	INIT_LIST_HEAD(&item->li_trans);
 	INIT_LIST_HEAD(&item->li_bio_list);

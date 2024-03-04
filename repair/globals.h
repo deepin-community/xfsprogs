@@ -92,6 +92,7 @@ extern int	lazy_count;		/* What to set if to if converting */
 extern bool	features_changed;	/* did we change superblock feature bits? */
 extern bool	add_inobtcount;		/* add inode btree counts to AGI */
 extern bool	add_bigtime;		/* add support for timestamps up to 2486 */
+extern bool	add_nrext64;
 
 /* misc status variables */
 
@@ -167,5 +168,7 @@ extern int		thread_count;
 
 /* If nonzero, simulate failure after this phase. */
 extern int		fail_after_phase;
+
+extern struct libxfs_init x;
 
 #endif /* _XFS_REPAIR_GLOBAL_H */

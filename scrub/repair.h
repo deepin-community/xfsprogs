@@ -1,14 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #ifndef XFS_SCRUB_REPAIR_H_
 #define XFS_SCRUB_REPAIR_H_
 
 struct action_list {
 	struct list_head	list;
-	size_t			nr;
+	unsigned long long	nr;
 	bool			sorted;
 };
 
@@ -16,7 +16,13 @@ int action_lists_alloc(size_t nr, struct action_list **listsp);
 void action_lists_free(struct action_list **listsp);
 
 void action_list_init(struct action_list *alist);
-size_t action_list_length(struct action_list *alist);
+
+static inline bool action_list_empty(const struct action_list *alist)
+{
+	return list_empty(&alist->list);
+}
+
+unsigned long long action_list_length(struct action_list *alist);
 void action_list_add(struct action_list *dest, struct action_item *item);
 void action_list_splice(struct action_list *dest, struct action_list *src);
 

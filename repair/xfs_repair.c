@@ -67,6 +67,7 @@ enum c_opt_nums {
 	CONVERT_LAZY_COUNT = 0,
 	CONVERT_INOBTCOUNT,
 	CONVERT_BIGTIME,
+	CONVERT_NREXT64,
 	C_MAX_OPTS,
 };
 
@@ -74,6 +75,7 @@ static char *c_opts[] = {
 	[CONVERT_LAZY_COUNT]	= "lazycount",
 	[CONVERT_INOBTCOUNT]	= "inobtcount",
 	[CONVERT_BIGTIME]	= "bigtime",
+	[CONVERT_NREXT64]	= "nrext64",
 	[C_MAX_OPTS]		= NULL,
 };
 
@@ -323,6 +325,15 @@ process_args(int argc, char **argv)
 						do_abort(
 		_("-c bigtime only supports upgrades\n"));
 					add_bigtime = true;
+					break;
+				case CONVERT_NREXT64:
+					if (!val)
+						do_abort(
+		_("-c nrext64 requires a parameter\n"));
+					if (strtol(val, NULL, 0) != 1)
+						do_abort(
+		_("-c nrext64 only supports upgrades\n"));
+					add_nrext64 = true;
 					break;
 				default:
 					unknown('c', val);
@@ -713,13 +724,11 @@ static void
 check_fs_vs_host_sectsize(
 	struct xfs_sb	*sb)
 {
-	int	fd, ret;
+	int	ret;
 	long	old_flags;
 	struct xfs_fsop_geom	geom = { 0 };
 
-	fd = libxfs_device_to_fd(x.ddev);
-
-	ret = -xfrog_geometry(fd, &geom);
+	ret = -xfrog_geometry(x.data.fd, &geom);
 	if (ret) {
 		do_log(_("Cannot get host filesystem geometry.\n"
 	"Repair may fail if there is a sector size mismatch between\n"
@@ -728,8 +737,8 @@ check_fs_vs_host_sectsize(
 	}
 
 	if (sb->sb_sectsize < geom.sectsize) {
-		old_flags = fcntl(fd, F_GETFL, 0);
-		if (fcntl(fd, F_SETFL, old_flags & ~O_DIRECT) < 0) {
+		old_flags = fcntl(x.data.fd, F_GETFL, 0);
+		if (fcntl(x.data.fd, F_SETFL, old_flags & ~O_DIRECT) < 0) {
 			do_warn(_(
 	"Sector size on host filesystem larger than image sector size.\n"
 	"Cannot turn off direct IO, so exiting.\n"));
@@ -738,8 +747,65 @@ check_fs_vs_host_sectsize(
 	}
 }
 
+/*
+ * If we set up a writeback function to set NEEDSREPAIR while the filesystem is
+ * dirty, there's a chance that calling libxfs_getsb could deadlock the buffer
+ * cache while trying to get the primary sb buffer if the first non-sb write to
+ * the filesystem is the result of a cache shake.  Retain a reference to the
+ * primary sb buffer to avoid all that.
+ */
+static struct xfs_buf *primary_sb_bp;	/* buffer for superblock */
+
+int
+retain_primary_sb(
+	struct xfs_mount	*mp)
+{
+	int			error;
+
+	error = -libxfs_buf_read(mp->m_ddev_targp, XFS_SB_DADDR,
+			XFS_FSS_TO_BB(mp, 1), 0, &primary_sb_bp,
+			&xfs_sb_buf_ops);
+	if (error)
+		return error;
+
+	libxfs_buf_unlock(primary_sb_bp);
+	return 0;
+}
+
+static void
+drop_primary_sb(void)
+{
+	if (!primary_sb_bp)
+		return;
+
+	libxfs_buf_lock(primary_sb_bp);
+	libxfs_buf_relse(primary_sb_bp);
+	primary_sb_bp = NULL;
+}
+
+static int
+get_primary_sb(
+	struct xfs_mount	*mp,
+	struct xfs_buf		**bpp)
+{
+	int			error;
+
+	*bpp = NULL;
+
+	if (!primary_sb_bp) {
+		error = retain_primary_sb(mp);
+		if (error)
+			return error;
+	}
+
+	libxfs_buf_lock(primary_sb_bp);
+	xfs_buf_hold(primary_sb_bp);
+	*bpp = primary_sb_bp;
+	return 0;
+}
+
 /* Clear needsrepair after a successful repair run. */
-void
+static void
 clear_needsrepair(
 	struct xfs_mount	*mp)
 {
@@ -758,15 +824,14 @@ clear_needsrepair(
 		do_warn(
 	_("Cannot clear needsrepair due to flush failure, err=%d.\n"),
 			error);
-		return;
+		goto drop;
 	}
 
 	/* Clear needsrepair from the superblock. */
-	bp = libxfs_getsb(mp);
-	if (!bp || bp->b_error) {
+	error = get_primary_sb(mp, &bp);
+	if (error) {
 		do_warn(
-	_("Cannot clear needsrepair from primary super, err=%d.\n"),
-			bp ? bp->b_error : ENOMEM);
+	_("Cannot clear needsrepair from primary super, err=%d.\n"), error);
 	} else {
 		mp->m_sb.sb_features_incompat &=
 				~XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR;
@@ -775,6 +840,8 @@ clear_needsrepair(
 	}
 	if (bp)
 		libxfs_buf_relse(bp);
+drop:
+	drop_primary_sb();
 }
 
 static void
@@ -797,11 +864,10 @@ force_needsrepair(
 	    xfs_sb_version_needsrepair(&mp->m_sb))
 		return;
 
-	bp = libxfs_getsb(mp);
-	if (!bp || bp->b_error) {
+	error = get_primary_sb(mp, &bp);
+	if (error) {
 		do_log(
-	_("couldn't get superblock to set needsrepair, err=%d\n"),
-				bp ? bp->b_error : ENOMEM);
+	_("couldn't get superblock to set needsrepair, err=%d\n"), error);
 	} else {
 		/*
 		 * It's possible that we need to set NEEDSREPAIR before we've
@@ -918,10 +984,9 @@ main(int argc, char **argv)
 
 	/* -f forces this, but let's be nice and autodetect it, as well. */
 	if (!isa_file) {
-		int		fd = libxfs_device_to_fd(x.ddev);
 		struct stat	statbuf;
 
-		if (fstat(fd, &statbuf) < 0)
+		if (fstat(x.data.fd, &statbuf) < 0)
 			do_warn(_("%s: couldn't stat \"%s\"\n"),
 				progname, fs_name);
 		else if (S_ISREG(statbuf.st_mode))
@@ -966,7 +1031,7 @@ main(int argc, char **argv)
 	 * initialized in phase 2.
 	 */
 	memset(&xfs_m, 0, sizeof(xfs_mount_t));
-	mp = libxfs_mount(&xfs_m, &psb, x.ddev, x.logdev, x.rtdev, 0);
+	mp = libxfs_mount(&xfs_m, &psb, &x, 0);
 
 	if (!mp)  {
 		fprintf(stderr,
@@ -1174,9 +1239,12 @@ main(int argc, char **argv)
 	phase4(mp);
 	phase_end(4);
 
-	if (no_modify)
+	if (no_modify) {
 		printf(_("No modify flag set, skipping phase 5\n"));
-	else {
+
+		if (mp->m_sb.sb_rblocks > 0)
+			check_rtmetadata(mp);
+	} else {
 		phase5(mp);
 	}
 	phase_end(5);

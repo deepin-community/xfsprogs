@@ -221,6 +221,105 @@ compare_sb(xfs_mount_t *mp, xfs_sb_t *sb)
 }
 
 /*
+ * If the fs feature bits on a secondary superblock don't match the
+ * primary, we need to update them.
+ */
+static inline int
+check_v5_feature_mismatch(
+	struct xfs_mount	*mp,
+	xfs_agnumber_t		agno,
+	struct xfs_sb		*sb)
+{
+	bool			dirty = false;
+
+	if (!xfs_has_crc(mp) || agno == 0)
+		return 0;
+
+	if (mp->m_sb.sb_features_compat != sb->sb_features_compat) {
+		if (no_modify) {
+			do_warn(
+	_("would fix compat feature mismatch in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_compat,
+					sb->sb_features_compat);
+		} else {
+			do_warn(
+	_("will fix compat feature mismatch in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_compat,
+					sb->sb_features_compat);
+			dirty = true;
+		}
+	}
+
+	/*
+	 * Ignore XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR becauses the repair upgrade
+	 * path sets it only on the primary while upgrading.
+	 */ 
+	if ((mp->m_sb.sb_features_incompat ^ sb->sb_features_incompat) &
+			~XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR) {
+		if (no_modify) {
+			do_warn(
+	_("would fix incompat feature mismatch in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_incompat,
+					sb->sb_features_incompat);
+		} else {
+			do_warn(
+	_("will fix incompat feature mismatch in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_incompat,
+					sb->sb_features_incompat);
+			dirty = true;
+		}
+	}
+
+	if (mp->m_sb.sb_features_ro_compat != sb->sb_features_ro_compat) {
+		if (no_modify) {
+			do_warn(
+	_("would fix ro compat feature mismatch in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_ro_compat,
+					sb->sb_features_ro_compat);
+		} else {
+			do_warn(
+	_("will fix ro compat feature mismatch in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_ro_compat,
+					sb->sb_features_ro_compat);
+			dirty = true;
+		}
+	}
+
+	/*
+	 * Log incompat feature bits are set and cleared from the primary super
+	 * as needed to protect against log replay on old kernels finding log
+	 * records that they cannot handle.  Secondary sb resyncs performed as
+	 * part of a geometry update to the primary sb (e.g. growfs, label/uuid
+	 * changes) will copy the log incompat feature bits, but it's not a
+	 * corruption for a secondary to have a bit set that is clear in the
+	 * primary super.
+	 */
+	if (mp->m_sb.sb_features_log_incompat != sb->sb_features_log_incompat) {
+		if (no_modify) {
+			do_log(
+	_("would sync log incompat feature in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_log_incompat,
+					sb->sb_features_log_incompat);
+		} else {
+			do_warn(
+	_("will sync log incompat feature in AG %u super, 0x%x != 0x%x\n"),
+					agno, mp->m_sb.sb_features_log_incompat,
+					sb->sb_features_log_incompat);
+			dirty = true;
+		}
+	}
+
+	if (!dirty)
+		return 0;
+
+	sb->sb_features_compat = mp->m_sb.sb_features_compat;
+	sb->sb_features_ro_compat = mp->m_sb.sb_features_ro_compat;
+	sb->sb_features_incompat = mp->m_sb.sb_features_incompat;
+	sb->sb_features_log_incompat = mp->m_sb.sb_features_log_incompat;
+	return XR_AG_SB_SEC;
+}
+
+/*
  * Possible fields that may have been set at mkfs time,
  * sb_inoalignmt, sb_unit, sb_width and sb_dirblklog.
  * The quota inode fields in the secondaries should be zero.
@@ -452,6 +551,8 @@ secondary_sb_whack(
 			rval |= XR_AG_SB_SEC;
 	}
 
+	rval |= check_v5_feature_mismatch(mp, i, sb);
+
 	if (xfs_sb_version_needsrepair(sb)) {
 		if (i == 0) {
 			if (!no_modify)
@@ -460,6 +561,14 @@ secondary_sb_whack(
 			else
 				do_warn(
 	_("would clear needsrepair flag and regenerate metadata\n"));
+			/*
+			 * If needsrepair is set on the primary super, there's
+			 * a possibility that repair crashed during an upgrade.
+			 * Set features_changed to ensure that the secondary
+			 * supers are rewritten with the new feature bits once
+			 * we've finished the upgrade.
+			 */
+			features_changed = true;
 		} else {
 			/*
 			 * Quietly clear needsrepair on the secondary supers as

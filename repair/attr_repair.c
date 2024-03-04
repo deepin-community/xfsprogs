@@ -579,6 +579,26 @@ process_leaf_attr_block(
 	firstb = mp->m_sb.sb_blocksize;
 	stop = xfs_attr3_leaf_hdr_size(leaf);
 
+	/*
+	 * Empty leaf blocks at offset zero can occur as a race between
+	 * setxattr and the system going down, so we only take action if we're
+	 * running in modify mode.  See xfs_attr3_leaf_verify for details of
+	 * how we've screwed this up many times.
+	 */
+	if (!leafhdr.count && da_bno == 0) {
+		if (no_modify) {
+			do_log(
+	_("would clear empty leaf attr block 0, inode %" PRIu64 "\n"),
+					ino);
+			return 0;
+		}
+
+		do_warn(
+	_("will clear empty leaf attr block 0, inode %" PRIu64 "\n"),
+				ino);
+		return 1;
+	}
+
 	/* does the count look sorta valid? */
 	if (!leafhdr.count ||
 	    leafhdr.count * sizeof(xfs_attr_leaf_entry_t) + stop >
@@ -1083,7 +1103,7 @@ process_longform_attr(
 	bno = blkmap_get(blkmap, 0);
 	if (bno == NULLFSBLOCK) {
 		if (dip->di_aformat == XFS_DINODE_FMT_EXTENTS &&
-				be16_to_cpu(dip->di_anextents) == 0)
+				xfs_dfork_attr_extents(dip) == 0)
 			return(0); /* the kernel can handle this state */
 		do_warn(
 	_("block 0 of inode %" PRIu64 " attribute fork is missing\n"),

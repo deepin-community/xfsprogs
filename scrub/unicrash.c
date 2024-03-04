@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #include "xfs.h"
 #include <stdint.h>
@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <sys/statvfs.h>
 #include <strings.h>
+#include <unicode/uclean.h>
 #include <unicode/ustring.h>
 #include <unicode/unorm2.h>
 #include <unicode/uspoof.h>

@@ -62,7 +62,7 @@ ablock_f(
 	xfs_fileoff_t		bno;
 	xfs_fsblock_t		dfsbno;
 	int			haveattr;
-	int			nex;
+	xfs_extnum_t		nex;
 	char			*p;
 	struct xfs_dinode	*dip = iocur_top->data;
 
@@ -126,7 +126,15 @@ daddr_f(
 	char		*p;
 
 	if (argc == 1) {
-		dbprintf(_("current daddr is %lld\n"), iocur_top->off >> BBSHIFT);
+		xfs_daddr_t	daddr = iocur_top->off >> BBSHIFT;
+
+		if (iocur_is_ddev(iocur_top))
+			dbprintf(_("datadev daddr is %lld\n"), daddr);
+		else if (iocur_is_extlogdev(iocur_top))
+			dbprintf(_("logdev daddr is %lld\n"), daddr);
+		else
+			dbprintf(_("current daddr is %lld\n"), daddr);
+
 		return 0;
 	}
 	d = (int64_t)strtoull(argv[1], &p, 0);
@@ -162,7 +170,7 @@ dblock_f(
 	xfs_fileoff_t	bno;
 	xfs_fsblock_t	dfsbno;
 	int		nb;
-	int		nex;
+	xfs_extnum_t	nex;
 	char		*p;
 	typnm_t		type;
 
@@ -220,6 +228,10 @@ fsblock_f(
 	char		*p;
 
 	if (argc == 1) {
+		if (!iocur_is_ddev(iocur_top)) {
+			dbprintf(_("cursor does not point to data device\n"));
+			return 0;
+		}
 		dbprintf(_("current fsblock is %lld\n"),
 			XFS_DADDR_TO_FSB(mp, iocur_top->off >> BBSHIFT));
 		return 0;
