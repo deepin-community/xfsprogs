@@ -499,8 +499,7 @@ mk_rbmino(xfs_mount_t *mp)
 
 	VFS_I(ip)->i_mode = S_IFREG;
 	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
-	if (ip->i_afp)
-		ip->i_afp->if_format = XFS_DINODE_FMT_EXTENTS;
+	libxfs_ifork_zap_attr(ip);
 
 	set_nlink(VFS_I(ip), 1);	/* account for sb ptr */
 
@@ -739,8 +738,7 @@ mk_rsumino(xfs_mount_t *mp)
 
 	VFS_I(ip)->i_mode = S_IFREG;
 	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
-	if (ip->i_afp)
-		ip->i_afp->if_format = XFS_DINODE_FMT_EXTENTS;
+	libxfs_ifork_zap_attr(ip);
 
 	set_nlink(VFS_I(ip), 1);	/* account for sb ptr */
 
@@ -838,8 +836,7 @@ mk_root_dir(xfs_mount_t *mp)
 
 	VFS_I(ip)->i_mode = mode|S_IFDIR;
 	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
-	if (ip->i_afp)
-		ip->i_afp->if_format = XFS_DINODE_FMT_EXTENTS;
+	libxfs_ifork_zap_attr(ip);
 
 	set_nlink(VFS_I(ip), 2);	/* account for . and .. */
 
@@ -1179,13 +1176,10 @@ entry_junked(
 	xfs_ino_t	ino2)
 {
 	do_warn(msg, iname, ino1, ino2);
-	if (!no_modify) {
-		if (verbose)
-			do_warn(_(", marking entry to be junked\n"));
-		else
-			do_warn("\n");
-	} else
-		do_warn(_(", would junk entry\n"));
+	if (!no_modify)
+		do_warn(_("junking entry\n"));
+	else
+		do_warn(_("would junk entry\n"));
 	return !no_modify;
 }
 
@@ -1209,7 +1203,7 @@ dir_binval(
 		return 0;
 
 	geo = tp->t_mountp->m_dir_geo;
-	ifp = XFS_IFORK_PTR(ip, XFS_DATA_FORK);
+	ifp = xfs_ifork_ptr(ip, XFS_DATA_FORK);
 	for_each_xfs_iext(ifp, &icur, &rec) {
 		for (dabno = roundup(rec.br_startoff, geo->fsbcount);
 		     dabno < rec.br_startoff + rec.br_blockcount;
@@ -1322,7 +1316,8 @@ longform_dir2_rebuild(
 	/* go through the hash list and re-add the inodes */
 
 	for (p = hashtab->first; p; p = p->nextbyorder) {
-
+		if (p->junkit)
+			continue;
 		if (p->name.name[0] == '/' || (p->name.name[0] == '.' &&
 				(p->name.len == 1 || (p->name.len == 2 &&
 						p->name.name[1] == '.'))))
@@ -1400,6 +1395,48 @@ dir2_kill_block(
 _("directory shrink failed (%d)\n"), error);
 }
 
+static inline void
+check_longform_ftype(
+	struct xfs_mount	*mp,
+	struct xfs_inode	*ip,
+	xfs_dir2_data_entry_t	*dep,
+	ino_tree_node_t		*irec,
+	int			ino_offset,
+	struct dir_hash_tab	*hashtab,
+	xfs_dir2_dataptr_t	addr,
+	struct xfs_da_args	*da,
+	struct xfs_buf		*bp)
+{
+	xfs_ino_t		inum = be64_to_cpu(dep->inumber);
+	uint8_t			dir_ftype;
+	uint8_t			ino_ftype;
+
+	if (!xfs_has_ftype(mp))
+		return;
+
+	dir_ftype = libxfs_dir2_data_get_ftype(mp, dep);
+	ino_ftype = get_inode_ftype(irec, ino_offset);
+
+	if (dir_ftype == ino_ftype)
+		return;
+
+	if (no_modify) {
+		do_warn(
+_("would fix ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
+			dir_ftype, ino_ftype,
+			ip->i_ino, inum);
+		return;
+	}
+
+	do_warn(
+_("fixing ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
+		dir_ftype, ino_ftype,
+		ip->i_ino, inum);
+	libxfs_dir2_data_put_ftype(mp, dep, ino_ftype);
+	libxfs_dir2_data_log_entry(da, bp, dep);
+	dir_hash_update_ftype(hashtab, addr, ino_ftype);
+}
+
 /*
  * process a data block, also checks for .. entry
  * and corrects it to match what we think .. should be
@@ -1416,7 +1453,7 @@ longform_dir2_entry_check_data(
 	struct dir_hash_tab	*hashtab,
 	freetab_t		**freetabp,
 	xfs_dablk_t		da_bno,
-	int			isblock)
+	bool			isblock)
 {
 	xfs_dir2_dataptr_t	addr;
 	xfs_dir2_leaf_entry_t	*blp;
@@ -1642,7 +1679,7 @@ longform_dir2_entry_check_data(
 		if (irec == NULL)  {
 			nbad++;
 			if (entry_junked(
-	_("entry \"%s\" in directory inode %" PRIu64 " points to non-existent inode %" PRIu64 ""),
+	_("entry \"%s\" in directory inode %" PRIu64 " points to non-existent inode %" PRIu64 ", "),
 					fname, ip->i_ino, inum)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
@@ -1659,7 +1696,7 @@ longform_dir2_entry_check_data(
 		if (is_inode_free(irec, ino_offset))  {
 			nbad++;
 			if (entry_junked(
-	_("entry \"%s\" in directory inode %" PRIu64 " points to free inode %" PRIu64),
+	_("entry \"%s\" in directory inode %" PRIu64 " points to free inode %" PRIu64 ", "),
 					fname, ip->i_ino, inum)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
@@ -1677,7 +1714,7 @@ longform_dir2_entry_check_data(
 			if (!inode_isadir(irec, ino_offset)) {
 				nbad++;
 				if (entry_junked(
-	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory"),
+	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory, "),
 						ORPHANAGE, inum, ip->i_ino)) {
 					dep->name[0] = '/';
 					libxfs_dir2_data_log_entry(&da, bp, dep);
@@ -1699,7 +1736,7 @@ longform_dir2_entry_check_data(
 				dep->name, libxfs_dir2_data_get_ftype(mp, dep))) {
 			nbad++;
 			if (entry_junked(
-	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
+	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name, "),
 					fname, inum, ip->i_ino)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
@@ -1730,13 +1767,18 @@ longform_dir2_entry_check_data(
 				/* ".." should be in the first block */
 				nbad++;
 				if (entry_junked(
-	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is not in the the first block"), fname,
+	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is not in the the first block, "), fname,
 						inum, ip->i_ino)) {
 					dir_hash_junkit(hashtab, addr);
 					dep->name[0] = '/';
 					libxfs_dir2_data_log_entry(&da, bp, dep);
 				}
 			}
+
+			if (!nbad)
+				check_longform_ftype(mp, ip, dep, irec,
+						ino_offset, hashtab, addr, &da,
+						bp);
 			continue;
 		}
 		ASSERT(no_modify || libxfs_verify_dir_ino(mp, inum));
@@ -1758,13 +1800,18 @@ longform_dir2_entry_check_data(
 				/* "." should be the first entry */
 				nbad++;
 				if (entry_junked(
-	_("entry \"%s\" in dir %" PRIu64 " is not the first entry"),
+	_("entry \"%s\" in dir %" PRIu64 " is not the first entry, "),
 						fname, inum, ip->i_ino)) {
 					dir_hash_junkit(hashtab, addr);
 					dep->name[0] = '/';
 					libxfs_dir2_data_log_entry(&da, bp, dep);
 				}
 			}
+
+			if (!nbad)
+				check_longform_ftype(mp, ip, dep, irec,
+						ino_offset, hashtab, addr, &da,
+						bp);
 			*need_dot = 0;
 			continue;
 		}
@@ -1775,31 +1822,8 @@ longform_dir2_entry_check_data(
 			continue;
 
 		/* validate ftype field if supported */
-		if (xfs_has_ftype(mp)) {
-			uint8_t dir_ftype;
-			uint8_t ino_ftype;
-
-			dir_ftype = libxfs_dir2_data_get_ftype(mp, dep);
-			ino_ftype = get_inode_ftype(irec, ino_offset);
-
-			if (dir_ftype != ino_ftype) {
-				if (no_modify) {
-					do_warn(
-	_("would fix ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
-						dir_ftype, ino_ftype,
-						ip->i_ino, inum);
-				} else {
-					do_warn(
-	_("fixing ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
-						dir_ftype, ino_ftype,
-						ip->i_ino, inum);
-					libxfs_dir2_data_put_ftype(mp, dep, ino_ftype);
-					libxfs_dir2_data_log_entry(&da, bp, dep);
-					dir_hash_update_ftype(hashtab, addr,
-							      ino_ftype);
-				}
-			}
-		}
+		check_longform_ftype(mp, ip, dep, irec, ino_offset, hashtab,
+				addr, &da, bp);
 
 		/*
 		 * check easy case first, regular inode, just bump
@@ -1810,7 +1834,14 @@ longform_dir2_entry_check_data(
 			continue;
 		}
 		parent = get_inode_parent(irec, ino_offset);
-		ASSERT(parent != 0);
+		if (parent == 0) {
+			if (no_modify)
+				do_warn(
+ _("unknown parent for inode %" PRIu64 "\n"),
+						inum);
+			else
+				ASSERT(parent != 0);
+		}
 		junkit = 0;
 		/*
 		 * bump up the link counts in parent and child
@@ -1852,8 +1883,7 @@ _("entry \"%s\" in dir inode %" PRIu64 " inconsistent with .. value (%" PRIu64 "
 				dir_hash_junkit(hashtab, addr);
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
-				if (verbose)
-					do_warn(
+				do_warn(
 					_("\twill clear entry \"%s\"\n"),
 						fname);
 			} else  {
@@ -2217,8 +2247,8 @@ longform_dir2_entry_check(
 	xfs_dablk_t		da_bno;
 	freetab_t		*freetab;
 	int			i;
-	int			isblock;
-	int			isleaf;
+	bool			isblock;
+	bool			isleaf;
 	xfs_fileoff_t		next_da_bno;
 	int			seeval;
 	int			fixit = 0;
@@ -2299,6 +2329,9 @@ longform_dir2_entry_check(
 				fixit++;
 				if (isblock)
 					goto out_fix;
+
+				libxfs_buf_relse(bp);
+				bp = NULL;
 				continue;
 			}
 		}
@@ -2310,6 +2343,7 @@ longform_dir2_entry_check(
 			break;
 
 		libxfs_buf_relse(bp);
+		bp = NULL;
 	}
 	fixit |= (*num_illegal != 0) || dir2_is_badino(ino) || *need_dot;
 
@@ -2337,7 +2371,7 @@ longform_dir2_entry_check(
 		}
 	}
 out_fix:
-	if (isblock && bp)
+	if (bp)
 		libxfs_buf_relse(bp);
 
 	if (!no_modify && (fixit || dotdot_update)) {
@@ -2406,10 +2440,7 @@ shortform_dir2_junk(
 	 */
 	(*index)--;
 
-	if (verbose)
-		do_warn(_("junking entry\n"));
-	else
-		do_warn("\n");
+	do_warn(_("junking entry\n"));
 	return sfep;
 }
 
@@ -2558,7 +2589,7 @@ shortform_dir2_entry_check(
 
 		if (irec == NULL)  {
 			do_warn(
-	_("entry \"%s\" in shortform directory %" PRIu64 " references non-existent inode %" PRIu64 "\n"),
+	_("entry \"%s\" in shortform directory %" PRIu64 " references non-existent inode %" PRIu64 ", "),
 				fname, ino, lino);
 			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
 						&max_size, &i, &bytes_deleted,
@@ -2575,7 +2606,7 @@ shortform_dir2_entry_check(
 		 */
 		if (is_inode_free(irec, ino_offset))  {
 			do_warn(
-	_("entry \"%s\" in shortform directory inode %" PRIu64 " points to free inode %" PRIu64 "\n"),
+	_("entry \"%s\" in shortform directory inode %" PRIu64 " points to free inode %" PRIu64 ", "),
 				fname, ino, lino);
 			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
 						&max_size, &i, &bytes_deleted,
@@ -2591,7 +2622,7 @@ shortform_dir2_entry_check(
 			 */
 			if (!inode_isadir(irec, ino_offset)) {
 				do_warn(
-	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory"),
+	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory, "),
 					ORPHANAGE, lino, ino);
 				next_sfep = shortform_dir2_junk(mp, sfp, sfep,
 						lino, &max_size, &i,
@@ -2613,7 +2644,7 @@ shortform_dir2_entry_check(
 				lino, sfep->namelen, sfep->name,
 				libxfs_dir2_sf_get_ftype(mp, sfep))) {
 			do_warn(
-_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
+_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name, "),
 				fname, lino, ino);
 			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
 						&max_size, &i, &bytes_deleted,
@@ -2638,7 +2669,7 @@ _("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
 			if (is_inode_reached(irec, ino_offset))  {
 				do_warn(
 	_("entry \"%s\" in directory inode %" PRIu64
-	  " references already connected inode %" PRIu64 ".\n"),
+	  " references already connected inode %" PRIu64 ", "),
 					fname, ino, lino);
 				next_sfep = shortform_dir2_junk(mp, sfp, sfep,
 						lino, &max_size, &i,
@@ -2662,7 +2693,7 @@ _("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
 				do_warn(
 	_("entry \"%s\" in directory inode %" PRIu64
 	  " not consistent with .. value (%" PRIu64
-	  ") in inode %" PRIu64 ",\n"),
+	  ") in inode %" PRIu64 ", "),
 					fname, ino, parent, lino);
 				next_sfep = shortform_dir2_junk(mp, sfp, sfep,
 						lino, &max_size, &i,

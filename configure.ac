@@ -1,13 +1,13 @@
-AC_INIT([xfsprogs], [5.16.0], [linux-xfs@vger.kernel.org])
-AC_PREREQ(2.50)
+AC_INIT([xfsprogs],[6.6.0],[linux-xfs@vger.kernel.org])
+AC_PREREQ([2.69])
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([include/libxfs.h])
-AC_CONFIG_HEADER(include/platform_defs.h)
+AC_CONFIG_HEADERS([include/platform_defs.h])
 AC_PREFIX_DEFAULT(/usr)
 
 AC_PROG_INSTALL
-AC_PROG_LIBTOOL
+LT_INIT
 
 AC_PROG_CC
 AC_ARG_VAR(BUILD_CC, [C compiler for build tools])
@@ -60,6 +60,11 @@ AC_ARG_ENABLE(lib64,
 	enable_lib64=yes)
 AC_SUBST(enable_lib64)
 
+AC_ARG_WITH([multiarch],
+[  --with-multiarch=ARCH   Specify the multiarch triplet],
+	multiarch=$withval)
+AC_SUBST(multiarch)
+
 AC_ARG_ENABLE(librt,
 [  --enable-librt=[yes/no]   Enable librt support [default=yes]],,
 	enable_librt=yes)
@@ -110,6 +115,11 @@ lib64)
 esac
 
 #
+# If the user specified a multiarch path then disable lib64
+#
+test -n "$multiarch" && enable_lib64=no
+
+#
 # Some important tools should be installed into the root partitions.
 #
 # Check whether exec_prefix=/usr: and install them to /sbin in that
@@ -143,6 +153,7 @@ AC_SUBST(LOCALIZED_FILES)
 AC_PACKAGE_GLOBALS(xfsprogs)
 AC_PACKAGE_UTILITIES(xfsprogs)
 AC_MULTILIB($enable_lib64)
+AC_MULTIARCH($multiarch)
 AC_RT($enable_librt)
 
 AC_PACKAGE_NEED_INI_H
@@ -176,11 +187,13 @@ AC_HAVE_FSETXATTR
 AC_HAVE_MREMAP
 AC_NEED_INTERNAL_FSXATTR
 AC_NEED_INTERNAL_FSCRYPT_ADD_KEY_ARG
+AC_NEED_INTERNAL_FSCRYPT_POLICY_V2
 AC_HAVE_GETFSMAP
 AC_HAVE_STATFS_FLAGS
 AC_HAVE_MAP_SYNC
 AC_HAVE_DEVMAPPER
 AC_HAVE_MALLINFO
+AC_HAVE_MALLINFO2
 AC_PACKAGE_WANT_ATTRIBUTES_H
 AC_HAVE_LIBATTR
 if test "$enable_scrub" = "yes"; then
@@ -197,6 +210,7 @@ AC_HAVE_SG_IO
 AC_HAVE_HDIO_GETGEO
 AC_CONFIG_SYSTEMD_SYSTEM_UNIT_DIR
 AC_CONFIG_CROND_DIR
+AC_CONFIG_UDEV_RULE_DIR
 
 if test "$enable_blkid" = yes; then
 AC_HAVE_BLKID_TOPO

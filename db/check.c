@@ -272,9 +272,9 @@ static int		ncheck_f(int argc, char **argv);
 static char		*prepend_path(char *oldpath, char *parent);
 static xfs_ino_t	process_block_dir_v2(blkmap_t *blkmap, int *dot,
 					     int *dotdot, inodata_t *id);
-static void		process_bmbt_reclist(xfs_bmbt_rec_t *rp, int numrecs,
-					     dbm_t type, inodata_t *id,
-					     xfs_rfsblock_t *tot,
+static void		process_bmbt_reclist(xfs_bmbt_rec_t *rp,
+					     xfs_extnum_t numrecs, dbm_t type,
+					     inodata_t *id, xfs_rfsblock_t *tot,
 					     blkmap_t **blkmapp);
 static void		process_btinode(inodata_t *id, struct xfs_dinode *dip,
 					dbm_t type, xfs_rfsblock_t *totd,
@@ -2176,7 +2176,7 @@ process_block_dir_v2(
 static void
 process_bmbt_reclist(
 	xfs_bmbt_rec_t		*rp,
-	int			numrecs,
+	xfs_extnum_t		numrecs,
 	dbm_t			type,
 	inodata_t		*id,
 	xfs_rfsblock_t		*tot,
@@ -2188,7 +2188,7 @@ process_bmbt_reclist(
 	xfs_filblks_t		c;
 	xfs_filblks_t		cp;
 	int			f;
-	int			i;
+	xfs_extnum_t		i;
 	xfs_agblock_t		iagbno;
 	xfs_agnumber_t		iagno;
 	xfs_fileoff_t		o;
@@ -2578,7 +2578,7 @@ process_data_dir_v2(
 		error++;
 	}
 	if ((be32_to_cpu(data->magic) == XFS_DIR2_BLOCK_MAGIC ||
-	     be32_to_cpu(data->magic) == XFS_DIR2_BLOCK_MAGIC) &&
+	     be32_to_cpu(data->magic) == XFS_DIR3_BLOCK_MAGIC) &&
 					stale != be32_to_cpu(btp->stale)) {
 		if (!sflag || v)
 			dbprintf(_("dir %lld block %d bad stale tail count %d\n"),
@@ -2711,14 +2711,18 @@ process_exinode(
 	int			whichfork)
 {
 	xfs_bmbt_rec_t		*rp;
+	xfs_extnum_t		max_nex;
 
 	rp = (xfs_bmbt_rec_t *)XFS_DFORK_PTR(dip, whichfork);
-	*nex = XFS_DFORK_NEXTENTS(dip, whichfork);
-	if (*nex < 0 || *nex > XFS_DFORK_SIZE(dip, mp, whichfork) /
+	*nex = xfs_dfork_nextents(dip, whichfork);
+	max_nex = xfs_iext_max_nextents(
+			xfs_dinode_has_large_extent_counts(dip),
+			whichfork);
+	if (*nex > max_nex || *nex > XFS_DFORK_SIZE(dip, mp, whichfork) /
 						sizeof(xfs_bmbt_rec_t)) {
 		if (!sflag || id->ilist)
-			dbprintf(_("bad number of extents %d for inode %lld\n"),
-				*nex, id->ino);
+			dbprintf(_("bad number of extents %llu for inode %lld\n"),
+				(unsigned long long)*nex, id->ino);
 		error++;
 		return;
 	}
@@ -2737,12 +2741,14 @@ process_inode(
 	inodata_t		*id = NULL;
 	xfs_ino_t		ino;
 	xfs_extnum_t		nextents = 0;
+	xfs_extnum_t		dnextents;
 	int			security;
 	xfs_rfsblock_t		totblocks;
 	xfs_rfsblock_t		totdblocks = 0;
 	xfs_rfsblock_t		totiblocks = 0;
 	dbm_t			type;
 	xfs_extnum_t		anextents = 0;
+	xfs_extnum_t		danextents;
 	xfs_rfsblock_t		atotdblocks = 0;
 	xfs_rfsblock_t		atotiblocks = 0;
 	xfs_qcnt_t		bc = 0;
@@ -2871,14 +2877,17 @@ process_inode(
 		error++;
 		return;
 	}
+
+	dnextents = xfs_dfork_data_extents(dip);
+	danextents = xfs_dfork_attr_extents(dip);
+
 	if (verbose || (id && id->ilist) || CHECK_BLIST(bno))
 		dbprintf(_("inode %lld mode %#o fmt %s "
 			 "afmt %s "
 			 "nex %d anex %d nblk %lld sz %lld%s%s%s%s%s%s%s\n"),
 			id->ino, mode, fmtnames[(int)dip->di_format],
 			fmtnames[(int)dip->di_aformat],
-			be32_to_cpu(dip->di_nextents),
-			be16_to_cpu(dip->di_anextents),
+			dnextents, danextents,
 			be64_to_cpu(dip->di_nblocks), be64_to_cpu(dip->di_size),
 			diflags & XFS_DIFLAG_REALTIME ? " rt" : "",
 			diflags & XFS_DIFLAG_PREALLOC ? " pre" : "",
@@ -2893,25 +2902,25 @@ process_inode(
 		type = DBM_DIR;
 		if (dip->di_format == XFS_DINODE_FMT_LOCAL)
 			break;
-		blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+		blkmap = blkmap_alloc(dnextents);
 		break;
 	case S_IFREG:
 		if (diflags & XFS_DIFLAG_REALTIME)
 			type = DBM_RTDATA;
 		else if (id->ino == mp->m_sb.sb_rbmino) {
 			type = DBM_RTBITMAP;
-			blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+			blkmap = blkmap_alloc(dnextents);
 			addlink_inode(id);
 		} else if (id->ino == mp->m_sb.sb_rsumino) {
 			type = DBM_RTSUM;
-			blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+			blkmap = blkmap_alloc(dnextents);
 			addlink_inode(id);
 		}
 		else if (id->ino == mp->m_sb.sb_uquotino ||
 			 id->ino == mp->m_sb.sb_gquotino ||
 			 id->ino == mp->m_sb.sb_pquotino) {
 			type = DBM_QUOTA;
-			blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+			blkmap = blkmap_alloc(dnextents);
 			addlink_inode(id);
 		}
 		else
@@ -2993,17 +3002,17 @@ process_inode(
 				be64_to_cpu(dip->di_nblocks), id->ino, totblocks);
 		error++;
 	}
-	if (nextents != be32_to_cpu(dip->di_nextents)) {
+	if (nextents != dnextents) {
 		if (v)
 			dbprintf(_("bad nextents %d for inode %lld, counted %d\n"),
-				be32_to_cpu(dip->di_nextents), id->ino, nextents);
+				dnextents, id->ino, nextents);
 		error++;
 	}
-	if (anextents != be16_to_cpu(dip->di_anextents)) {
+	if (anextents != danextents) {
 		if (v)
 			dbprintf(_("bad anextents %d for inode %lld, counted "
 				 "%d\n"),
-				be16_to_cpu(dip->di_anextents), id->ino, anextents);
+				danextents, id->ino, anextents);
 		error++;
 	}
 	if (type == DBM_DIR)
@@ -3443,7 +3452,7 @@ process_leaf_node_dir_v2_int(
 				 id->ino, dabno, stale,
 				 be16_to_cpu(leaf3->hdr.stale));
 		error++;
-	} else if (!leaf && stale != be16_to_cpu(leaf->hdr.stale)) {
+	} else if (!leaf3 && stale != be16_to_cpu(leaf->hdr.stale)) {
 		if (!sflag || v)
 			dbprintf(_("dir %lld block %d stale mismatch "
 				 "%d/%d\n"),
@@ -4839,8 +4848,8 @@ scanfunc_refcnt(
 				char		*msg;
 
 				agbno = be32_to_cpu(rp[i].rc_startblock);
-				if (agbno >= XFS_REFC_COW_START) {
-					agbno -= XFS_REFC_COW_START;
+				if (agbno & XFS_REFC_COWFLAG) {
+					agbno &= ~XFS_REFC_COWFLAG;
 					msg = _(
 		"leftover CoW extent (%u/%u) len %u\n");
 				} else {

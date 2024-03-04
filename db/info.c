@@ -30,7 +30,7 @@ info_f(
 	struct xfs_fsop_geom	geo;
 
 	libxfs_fs_geometry(mp, &geo, XFS_FS_GEOM_MAX_STRUCT_VER);
-	xfs_report_geom(&geo, fsdevice, x.logname, x.rtname);
+	xfs_report_geom(&geo, x.data.name, x.log.name, x.rt.name);
 	return 0;
 }
 
@@ -76,14 +76,14 @@ print_agresv_info(
 	error = -libxfs_refcountbt_calc_reserves(mp, NULL, pag, &ask, &used);
 	if (error)
 		xfrog_perror(error, "refcountbt");
-	error = -libxfs_finobt_calc_reserves(mp, NULL, pag, &ask, &used);
+	error = -libxfs_finobt_calc_reserves(pag, NULL, &ask, &used);
 	if (error)
 		xfrog_perror(error, "finobt");
 	error = -libxfs_rmapbt_calc_reserves(mp, NULL, pag, &ask, &used);
 	if (error)
 		xfrog_perror(error, "rmapbt");
 
-	error = -libxfs_read_agf(mp, NULL, agno, 0, &bp);
+	error = -libxfs_read_agf(pag, NULL, 0, &bp);
 	if (error)
 		xfrog_perror(error, "AGF");
 	agf = bp->b_addr;

@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #include "xfs.h"
 #include <stdint.h>
@@ -18,7 +18,6 @@
 #include "common.h"
 #include "progress.h"
 #include "scrub.h"
-#include "xfs_errortag.h"
 #include "repair.h"
 #include "descr.h"
 
@@ -122,6 +121,7 @@ scrub_warn_incomplete_scrub(
 static enum check_outcome
 xfs_check_metadata(
 	struct scrub_ctx		*ctx,
+	struct xfs_fd			*xfdp,
 	struct xfs_scrub_metadata	*meta,
 	bool				is_inode)
 {
@@ -135,7 +135,7 @@ xfs_check_metadata(
 
 	dbg_printf("check %s flags %xh\n", descr_render(&dsc), meta->sm_flags);
 retry:
-	error = -xfrog_scrub_metadata(&ctx->mnt, meta);
+	error = -xfrog_scrub_metadata(xfdp, meta);
 	if (debug_tweak_on("XFS_SCRUB_FORCE_REPAIR") && !error)
 		meta->sm_flags |= XFS_SCRUB_OFLAG_CORRUPT;
 	switch (error) {
@@ -316,7 +316,7 @@ scrub_meta_type(
 	background_sleep();
 
 	/* Check the item. */
-	fix = xfs_check_metadata(ctx, &meta, false);
+	fix = xfs_check_metadata(ctx, &ctx->mnt, &meta, false);
 	progress_add(1);
 
 	switch (fix) {
@@ -446,115 +446,48 @@ scrub_estimate_ag_work(
 }
 
 /*
- * Scrub inode metadata.  If errors occur, this function will log them and
- * return nonzero.
+ * Scrub file metadata of some sort.  If errors occur, this function will log
+ * them and return nonzero.
  */
-static int
-__scrub_file(
+int
+scrub_file(
 	struct scrub_ctx		*ctx,
-	uint64_t			ino,
-	uint32_t			gen,
+	int				fd,
+	const struct xfs_bulkstat	*bstat,
 	unsigned int			type,
 	struct action_list		*alist)
 {
 	struct xfs_scrub_metadata	meta = {0};
+	struct xfs_fd			xfd;
+	struct xfs_fd			*xfdp = &ctx->mnt;
 	enum check_outcome		fix;
 
 	assert(type < XFS_SCRUB_TYPE_NR);
 	assert(xfrog_scrubbers[type].type == XFROG_SCRUB_TYPE_INODE);
 
 	meta.sm_type = type;
-	meta.sm_ino = ino;
-	meta.sm_gen = gen;
+	meta.sm_ino = bstat->bs_ino;
+	meta.sm_gen = bstat->bs_gen;
+
+	/*
+	 * If the caller passed us a file descriptor for a scrub, use it
+	 * instead of scrub-by-handle because this enables the kernel to skip
+	 * costly inode btree lookups.
+	 */
+	if (fd >= 0) {
+		memcpy(&xfd, xfdp, sizeof(xfd));
+		xfd.fd = fd;
+		xfdp = &xfd;
+	}
 
 	/* Scrub the piece of metadata. */
-	fix = xfs_check_metadata(ctx, &meta, true);
+	fix = xfs_check_metadata(ctx, xfdp, &meta, true);
 	if (fix == CHECK_ABORT)
 		return ECANCELED;
 	if (fix == CHECK_DONE)
 		return 0;
 
 	return scrub_save_repair(ctx, alist, &meta);
-}
-
-int
-scrub_inode_fields(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_INODE, alist);
-}
-
-int
-scrub_data_fork(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_BMBTD, alist);
-}
-
-int
-scrub_attr_fork(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_BMBTA, alist);
-}
-
-int
-scrub_cow_fork(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_BMBTC, alist);
-}
-
-int
-scrub_dir(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_DIR, alist);
-}
-
-int
-scrub_attr(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_XATTR, alist);
-}
-
-int
-scrub_symlink(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_SYMLINK, alist);
-}
-
-int
-scrub_parent(
-	struct scrub_ctx	*ctx,
-	uint64_t		ino,
-	uint32_t		gen,
-	struct action_list	*alist)
-{
-	return __scrub_file(ctx, ino, gen, XFS_SCRUB_TYPE_PARENT, alist);
 }
 
 /*
@@ -566,26 +499,16 @@ static bool
 __scrub_test(
 	struct scrub_ctx		*ctx,
 	unsigned int			type,
-	bool				repair)
+	unsigned int			flags)
 {
 	struct xfs_scrub_metadata	meta = {0};
-	struct xfs_error_injection	inject;
-	static bool			injected;
 	int				error;
 
 	if (debug_tweak_on("XFS_SCRUB_NO_KERNEL"))
 		return false;
-	if (debug_tweak_on("XFS_SCRUB_FORCE_REPAIR") && !injected) {
-		inject.fd = ctx->mnt.fd;
-		inject.errtag = XFS_ERRTAG_FORCE_SCRUB_REPAIR;
-		error = ioctl(ctx->mnt.fd, XFS_IOC_ERROR_INJECTION, &inject);
-		if (error == 0)
-			injected = true;
-	}
 
 	meta.sm_type = type;
-	if (repair)
-		meta.sm_flags |= XFS_SCRUB_IFLAG_REPAIR;
+	meta.sm_flags = flags;
 	error = -xfrog_scrub_metadata(&ctx->mnt, &meta);
 	switch (error) {
 	case 0:
@@ -598,13 +521,15 @@ _("Filesystem is mounted read-only; cannot proceed."));
 		str_info(ctx, ctx->mntpoint,
 _("Filesystem is mounted norecovery; cannot proceed."));
 		return false;
+	case EINVAL:
 	case EOPNOTSUPP:
 	case ENOTTY:
 		if (debug || verbose)
 			str_info(ctx, ctx->mntpoint,
 _("Kernel %s %s facility not detected."),
 					_(xfrog_scrubbers[type].descr),
-					repair ? _("repair") : _("scrub"));
+					(flags & XFS_SCRUB_IFLAG_REPAIR) ?
+						_("repair") : _("scrub"));
 		return false;
 	case ENOENT:
 		/* Scrubber says not present on this fs; that's fine. */
@@ -619,56 +544,64 @@ bool
 can_scrub_fs_metadata(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_PROBE, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_PROBE, 0);
 }
 
 bool
 can_scrub_inode(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_INODE, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_INODE, 0);
 }
 
 bool
 can_scrub_bmap(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_BMBTD, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_BMBTD, 0);
 }
 
 bool
 can_scrub_dir(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_DIR, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_DIR, 0);
 }
 
 bool
 can_scrub_attr(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_XATTR, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_XATTR, 0);
 }
 
 bool
 can_scrub_symlink(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_SYMLINK, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_SYMLINK, 0);
 }
 
 bool
 can_scrub_parent(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_PARENT, false);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_PARENT, 0);
 }
 
 bool
 xfs_can_repair(
 	struct scrub_ctx	*ctx)
 {
-	return __scrub_test(ctx, XFS_SCRUB_TYPE_PROBE, true);
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_PROBE, XFS_SCRUB_IFLAG_REPAIR);
+}
+
+bool
+can_force_rebuild(
+	struct scrub_ctx	*ctx)
+{
+	return __scrub_test(ctx, XFS_SCRUB_TYPE_PROBE,
+			XFS_SCRUB_IFLAG_REPAIR | XFS_SCRUB_IFLAG_FORCE_REBUILD);
 }
 
 /* General repair routines. */
@@ -677,7 +610,7 @@ xfs_can_repair(
 enum check_outcome
 xfs_repair_metadata(
 	struct scrub_ctx		*ctx,
-	int				fd,
+	struct xfs_fd			*xfdp,
 	struct action_item		*aitem,
 	unsigned int			repair_flags)
 {
@@ -690,6 +623,8 @@ xfs_repair_metadata(
 	assert(!debug_tweak_on("XFS_SCRUB_NO_KERNEL"));
 	meta.sm_type = aitem->type;
 	meta.sm_flags = aitem->flags | XFS_SCRUB_IFLAG_REPAIR;
+	if (use_force_rebuild)
+		meta.sm_flags |= XFS_SCRUB_IFLAG_FORCE_REBUILD;
 	switch (xfrog_scrubbers[aitem->type].type) {
 	case XFROG_SCRUB_TYPE_AGHEADER:
 	case XFROG_SCRUB_TYPE_PERAG:
@@ -715,7 +650,7 @@ xfs_repair_metadata(
 		str_info(ctx, descr_render(&dsc),
 				_("Attempting optimization."));
 
-	error = -xfrog_scrub_metadata(&ctx->mnt, &meta);
+	error = -xfrog_scrub_metadata(xfdp, &meta);
 	switch (error) {
 	case 0:
 		/* No operational errors encountered. */
@@ -735,6 +670,15 @@ _("Filesystem is shut down, aborting."));
 	case ENOTTY:
 	case EOPNOTSUPP:
 		/*
+		 * If the kernel cannot perform the optimization that we
+		 * requested; or we forced a repair but the kernel doesn't know
+		 * how to perform the repair, don't requeue the request.  Mark
+		 * it done and move on.
+		 */
+		if (is_unoptimized(&oldm) ||
+		    debug_tweak_on("XFS_SCRUB_FORCE_REPAIR"))
+			return CHECK_DONE;
+		/*
 		 * If we're in no-complain mode, requeue the check for
 		 * later.  It's possible that an error in another
 		 * component caused us to flag an error in this
@@ -744,13 +688,6 @@ _("Filesystem is shut down, aborting."));
 		 */
 		if (!(repair_flags & XRM_COMPLAIN_IF_UNFIXED))
 			return CHECK_RETRY;
-		/*
-		 * If we forced repairs or this is a preen, don't
-		 * error out if the kernel doesn't know how to fix.
-		 */
-		if (is_unoptimized(&oldm) ||
-		    debug_tweak_on("XFS_SCRUB_FORCE_REPAIR"))
-			return CHECK_DONE;
 		fallthrough;
 	case EINVAL:
 		/* Kernel doesn't know how to repair this? */

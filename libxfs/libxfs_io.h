@@ -14,6 +14,7 @@
 struct xfs_buf;
 struct xfs_mount;
 struct xfs_perag;
+struct libxfs_init;
 
 /*
  * IO verifier callbacks need the xfs_mount pointer, so we have to behave
@@ -25,6 +26,7 @@ struct xfs_buftarg {
 	pthread_mutex_t		lock;
 	unsigned long		writes_left;
 	dev_t			bt_bdev;
+	int			bt_bdev_fd;
 	unsigned int		flags;
 };
 
@@ -50,8 +52,7 @@ xfs_buftarg_trip_write(
 	pthread_mutex_unlock(&btp->lock);
 }
 
-extern void	libxfs_buftarg_init(struct xfs_mount *mp, dev_t ddev,
-				    dev_t logdev, dev_t rtdev);
+void libxfs_buftarg_init(struct xfs_mount *mp, struct libxfs_init *xi);
 int libxfs_blkdev_issue_flush(struct xfs_buftarg *btp);
 
 #define LIBXFS_BBTOOFF64(bbs)	(((xfs_off_t)(bbs)) << BBSHIFT)
@@ -224,6 +225,9 @@ xfs_buf_hold(struct xfs_buf *bp)
 {
 	bp->b_node.cn_count++;
 }
+
+void xfs_buf_lock(struct xfs_buf *bp);
+void xfs_buf_unlock(struct xfs_buf *bp);
 
 int libxfs_buf_get_uncached(struct xfs_buftarg *targ, size_t bblen, int flags,
 		struct xfs_buf **bpp);

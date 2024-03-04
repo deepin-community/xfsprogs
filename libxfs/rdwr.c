@@ -62,13 +62,13 @@ static void libxfs_brelse(struct cache_node *node);
 int
 libxfs_device_zero(struct xfs_buftarg *btp, xfs_daddr_t start, uint len)
 {
+	int		fd = btp->bt_bdev_fd;
 	xfs_off_t	start_offset, end_offset, offset;
 	ssize_t		zsize, bytes;
 	size_t		len_bytes;
 	char		*z;
-	int		error, fd;
+	int		error;
 
-	fd = libxfs_device_to_fd(btp->bt_bdev);
 	start_offset = LIBXFS_BBTOOFF64(start);
 
 	/* try to use special zeroing methods, fall back to writes if needed */
@@ -376,6 +376,22 @@ libxfs_getbufr_map(struct xfs_buftarg *btp, xfs_daddr_t blkno, int bblen,
 	return bp;
 }
 
+void
+xfs_buf_lock(
+	struct xfs_buf	*bp)
+{
+	if (use_xfs_buf_lock)
+		pthread_mutex_lock(&bp->b_lock);
+}
+
+void
+xfs_buf_unlock(
+	struct xfs_buf	*bp)
+{
+	if (use_xfs_buf_lock)
+		pthread_mutex_unlock(&bp->b_lock);
+}
+
 static int
 __cache_lookup(
 	struct xfs_bufkey	*key,
@@ -582,7 +598,7 @@ int
 libxfs_readbufr(struct xfs_buftarg *btp, xfs_daddr_t blkno, struct xfs_buf *bp,
 		int len, int flags)
 {
-	int	fd = libxfs_device_to_fd(btp->bt_bdev);
+	int	fd = btp->bt_bdev_fd;
 	int	bytes = BBTOB(len);
 	int	error;
 
@@ -615,12 +631,11 @@ libxfs_readbuf_verify(
 int
 libxfs_readbufr_map(struct xfs_buftarg *btp, struct xfs_buf *bp, int flags)
 {
-	int	fd;
+	int	fd = btp->bt_bdev_fd;
 	int	error = 0;
 	void	*buf;
 	int	i;
 
-	fd = libxfs_device_to_fd(btp->bt_bdev);
 	buf = bp->b_addr;
 	for (i = 0; i < bp->b_nmaps; i++) {
 		off64_t	offset = LIBXFS_BBTOOFF64(bp->b_maps[i].bm_bn);
@@ -804,7 +819,7 @@ int
 libxfs_bwrite(
 	struct xfs_buf	*bp)
 {
-	int		fd = libxfs_device_to_fd(bp->b_target->bt_bdev);
+	int		fd = bp->b_target->bt_bdev_fd;
 
 	/*
 	 * we never write buffers that are marked stale. This indicates they
@@ -1069,7 +1084,12 @@ libxfs_iget(
 {
 	struct xfs_inode	*ip;
 	struct xfs_buf		*bp;
+	struct xfs_perag	*pag;
 	int			error = 0;
+
+	/* reject inode numbers outside existing AGs */
+	if (!ino || XFS_INO_TO_AGNO(mp, ino) >= mp->m_sb.sb_agcount)
+		return -EINVAL;
 
 	ip = kmem_cache_zalloc(xfs_inode_cache, 0);
 	if (!ip)
@@ -1078,9 +1098,13 @@ libxfs_iget(
 	VFS_I(ip)->i_count = 1;
 	ip->i_ino = ino;
 	ip->i_mount = mp;
+	ip->i_af.if_format = XFS_DINODE_FMT_EXTENTS;
 	spin_lock_init(&VFS_I(ip)->i_lock);
 
-	error = xfs_imap(mp, tp, ip->i_ino, &ip->i_imap, 0);
+	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
+	error = xfs_imap(pag, tp, ip->i_ino, &ip->i_imap, 0);
+	xfs_perag_put(pag);
+
 	if (error)
 		goto out_destroy;
 
@@ -1116,10 +1140,9 @@ libxfs_idestroy(xfs_inode_t *ip)
 			libxfs_idestroy_fork(&ip->i_df);
 			break;
 	}
-	if (ip->i_afp) {
-		libxfs_idestroy_fork(ip->i_afp);
-		kmem_cache_free(xfs_ifork_cache, ip->i_afp);
-	}
+
+	libxfs_ifork_zap_attr(ip);
+
 	if (ip->i_cowfp) {
 		libxfs_idestroy_fork(ip->i_cowfp);
 		kmem_cache_free(xfs_ifork_cache, ip->i_cowfp);
@@ -1147,13 +1170,12 @@ int
 libxfs_blkdev_issue_flush(
 	struct xfs_buftarg	*btp)
 {
-	int			fd, ret;
+	int			ret;
 
 	if (btp->bt_bdev == 0)
 		return 0;
 
-	fd = libxfs_device_to_fd(btp->bt_bdev);
-	ret = platform_flush_device(fd, btp->bt_bdev);
+	ret = platform_flush_device(btp->bt_bdev_fd, btp->bt_bdev);
 	return ret ? -errno : 0;
 }
 

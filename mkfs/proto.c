@@ -21,6 +21,7 @@ static int newfile(xfs_trans_t *tp, xfs_inode_t *ip, int symlink, int logit,
 static char *newregfile(char **pp, int *len);
 static void rtinit(xfs_mount_t *mp);
 static long filesize(int fd);
+static int slashes_are_spaces;
 
 /*
  * Use this for block reservations needed for mkfs's conditions
@@ -171,6 +172,30 @@ getstr(
 	return NULL;
 }
 
+/* Extract directory entry name from a protofile. */
+static char *
+getdirentname(
+	char	**pp)
+{
+	char	*p = getstr(pp);
+	char	*c = p;
+
+	if (!p)
+		return NULL;
+
+	if (!slashes_are_spaces)
+		return p;
+
+	/* Replace slash with space because slashes aren't allowed. */
+	while (*c) {
+		if (*c == '/')
+			*c = ' ';
+		c++;
+	}
+
+	return p;
+}
+
 static void
 rsvfile(
 	xfs_mount_t	*mp,
@@ -237,7 +262,7 @@ newfile(
 
 	flags = 0;
 	mp = ip->i_mount;
-	if (symlink && len <= XFS_IFORK_DSIZE(ip)) {
+	if (symlink && len <= xfs_inode_data_fork_size(ip)) {
 		libxfs_init_local_fork(ip, XFS_DATA_FORK, buf, len);
 		ip->i_df.if_format = XFS_DINODE_FMT_LOCAL;
 		flags = XFS_ILOG_DDATA;
@@ -326,6 +351,12 @@ newdirent(
 	int	error;
 	int	rsv;
 
+	if (!libxfs_dir2_namecheck(name->name, name->len)) {
+		fprintf(stderr, _("%.*s: invalid directory entry name\n"),
+				name->len, name->name);
+		exit(1);
+	}
+
 	rsv = XFS_DIRENTER_SPACE_RES(mp, name->len);
 
 	error = -libxfs_dir_createname(tp, pip, name, inum, rsv);
@@ -378,7 +409,7 @@ parseproto(
 	xfs_trans_t	*tp;
 	int		val;
 	int		isroot = 0;
-	cred_t		creds;
+	struct cred	creds;
 	char		*value;
 	struct xfs_name	xname;
 
@@ -446,6 +477,7 @@ parseproto(
 	mode |= val;
 	creds.cr_uid = (int)getnum(getstr(pp), 0, 0, false);
 	creds.cr_gid = (int)getnum(getstr(pp), 0, 0, false);
+	creds.cr_flags = CRED_FORCE_GID;
 	xname.name = (unsigned char *)name;
 	xname.len = name ? strlen(name) : 0;
 	xname.type = 0;
@@ -579,7 +611,7 @@ parseproto(
 			rtinit(mp);
 		tp = NULL;
 		for (;;) {
-			name = getstr(pp);
+			name = getdirentname(pp);
 			if (!name)
 				break;
 			if (strcmp(name, "$") == 0)
@@ -605,8 +637,10 @@ void
 parse_proto(
 	xfs_mount_t	*mp,
 	struct fsxattr	*fsx,
-	char		**pp)
+	char		**pp,
+	int		proto_slashes_are_spaces)
 {
+	slashes_are_spaces = proto_slashes_are_spaces;
 	parseproto(mp, NULL, fsx, pp, NULL);
 }
 

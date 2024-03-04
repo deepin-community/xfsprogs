@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #include "xfs.h"
 #include <stdint.h>
@@ -138,7 +138,7 @@ scrub_scan_estimate_blocks(
 	*d_blocks = ctx->mnt.fsgeom.datablocks;
 	*d_bfree = fc.freedata;
 	*r_blocks = ctx->mnt.fsgeom.rtblocks;
-	*r_bfree = fc.freertx;
+	*r_bfree = fc.freertx * ctx->mnt.fsgeom.rtextsize;
 	*f_files_used = fc.allocino - fc.freeino;
 
 	return 0;

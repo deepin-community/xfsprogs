@@ -113,6 +113,17 @@ xfs_da_state_free(xfs_da_state_t *state)
 	kmem_cache_free(xfs_da_state_cache, state);
 }
 
+void
+xfs_da_state_reset(
+	struct xfs_da_state	*state,
+	struct xfs_da_args	*args)
+{
+	xfs_da_state_kill_altpath(state);
+	memset(state, 0, sizeof(struct xfs_da_state));
+	state->args = args;
+	state->mp = state->args->dp->i_mount;
+}
+
 static inline int xfs_dabuf_nfsb(struct xfs_mount *mp, int whichfork)
 {
 	if (whichfork == XFS_DATA_FORK)
@@ -478,6 +489,9 @@ xfs_da3_split(
 	int			i;
 
 	trace_xfs_da_split(state->args);
+
+	if (XFS_TEST_ERROR(false, state->mp, XFS_ERRTAG_DA_LEAF_SPLIT))
+		return -EIO;
 
 	/*
 	 * Walk back up the tree splitting/inserting/adjusting as necessary.
@@ -2174,8 +2188,8 @@ xfs_da_grow_inode_int(
 		 */
 		mapp = kmem_alloc(sizeof(*mapp) * count, 0);
 		for (b = *bno, mapi = 0; b < *bno + count; ) {
-			nmap = min(XFS_BMAP_MAX_NMAP, count);
 			c = (int)(*bno + count - b);
+			nmap = min(XFS_BMAP_MAX_NMAP, c);
 			error = xfs_bmapi_write(tp, dp, b, c,
 					xfs_bmapi_aflag(w)|XFS_BMAPI_METADATA,
 					args->total, &mapp[mapi], &nmap);
