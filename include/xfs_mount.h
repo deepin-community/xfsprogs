@@ -10,8 +10,19 @@
 struct xfs_inode;
 struct xfs_buftarg;
 struct xfs_da_geometry;
+struct libxfs_init;
 
 typedef void (*buf_writeback_fn)(struct xfs_buf *bp);
+
+/* dynamic preallocation free space thresholds, 5% down to 1% */
+enum {
+	XFS_LOWSP_1_PCNT = 0,
+	XFS_LOWSP_2_PCNT,
+	XFS_LOWSP_3_PCNT,
+	XFS_LOWSP_4_PCNT,
+	XFS_LOWSP_5_PCNT,
+	XFS_LOWSP_MAX,
+};
 
 /*
  * Define a user-level mount structure with all we need
@@ -39,7 +50,7 @@ typedef struct xfs_mount {
 	xfs_agnumber_t		m_maxagi;	/* highest inode alloc group */
         struct xfs_ino_geometry	m_ino_geo;	/* inode geometry */
 	uint			m_rsumlevels;	/* rt summary levels */
-	uint			m_rsumsize;	/* size of rt summary, bytes */
+	xfs_filblks_t		m_rsumblocks;	/* size of rt summary, FSBs */
 	/*
 	 * Optional cache of rt summary level per bitmap block with the
 	 * invariant that m_rsum_cache[bbno] <= the minimum i for which
@@ -60,6 +71,7 @@ typedef struct xfs_mount {
 	uint8_t			m_blkbb_log;	/* blocklog - BBSHIFT */
 	uint8_t			m_sectbb_log;	/* sectorlog - BBSHIFT */
 	uint8_t			m_agno_log;	/* log #ag's */
+	int8_t			m_rtxblklog;	/* log2 of rextsize, if possible */
 	uint			m_blockmask;	/* sb_blocksize-1 */
 	uint			m_blockwsize;	/* sb_blocksize in words */
 	uint			m_blockwmask;	/* blockwsize-1 */
@@ -79,8 +91,10 @@ typedef struct xfs_mount {
 	xfs_extlen_t		m_ag_prealloc_blocks; /* reserved ag blocks */
 	uint			m_alloc_set_aside; /* space we can't use */
 	uint			m_ag_max_usable; /* max space per AG */
-	struct radix_tree_root	m_perag_tree;
+	struct xarray		m_perags;
 	uint64_t		m_features;	/* active filesystem features */
+	uint64_t		m_low_space[XFS_LOWSP_MAX];
+	uint64_t		m_rtxblkmask;	/* rt extent block mask */
 	unsigned long		m_opstate;	/* dynamic state flags */
 	bool			m_finobt_nores; /* no per-AG finobt resv. */
 	uint			m_qflags;	/* quota status flags */
@@ -154,6 +168,8 @@ typedef struct xfs_mount {
 #define XFS_FEAT_INOBTCNT	(1ULL << 23)	/* inobt block counts */
 #define XFS_FEAT_BIGTIME	(1ULL << 24)	/* large timestamps */
 #define XFS_FEAT_NEEDSREPAIR	(1ULL << 25)	/* needs xfs_repair */
+#define XFS_FEAT_NREXT64	(1ULL << 26)	/* large extent counters */
+#define XFS_FEAT_EXCHANGE_RANGE	(1ULL << 27)	/* exchange range */
 
 #define __XFS_HAS_FEAT(name, NAME) \
 static inline bool xfs_has_ ## name (struct xfs_mount *mp) \
@@ -197,6 +213,8 @@ __XFS_HAS_FEAT(realtime, REALTIME)
 __XFS_HAS_FEAT(inobtcounts, INOBTCNT)
 __XFS_HAS_FEAT(bigtime, BIGTIME)
 __XFS_HAS_FEAT(needsrepair, NEEDSREPAIR)
+__XFS_HAS_FEAT(large_extent_counts, NREXT64)
+__XFS_HAS_FEAT(exchange_range, EXCHANGE_RANGE)
 
 /* Kernel mount features that we don't support */
 #define __XFS_UNSUPP_FEAT(name) \
@@ -210,6 +228,7 @@ __XFS_UNSUPP_FEAT(ikeep)
 __XFS_UNSUPP_FEAT(swalloc)
 __XFS_UNSUPP_FEAT(small_inums)
 __XFS_UNSUPP_FEAT(readonly)
+__XFS_UNSUPP_FEAT(grpid)
 
 /* Operational mount state flags */
 #define XFS_OPSTATE_INODE32		0	/* inode32 allocator active */
@@ -257,8 +276,9 @@ __XFS_UNSUPP_OPSTATE(shutdown)
 
 #define LIBXFS_BHASHSIZE(sbp) 		(1<<10)
 
+void libxfs_compute_all_maxlevels(struct xfs_mount *mp);
 struct xfs_mount *libxfs_mount(struct xfs_mount *mp, struct xfs_sb *sb,
-		dev_t dev, dev_t logdev, dev_t rtdev, unsigned int flags);
+		struct libxfs_init *xi, unsigned int flags);
 int libxfs_flush_mount(struct xfs_mount *mp);
 int		libxfs_umount(struct xfs_mount *mp);
 extern void	libxfs_rtmount_destroy (xfs_mount_t *);
@@ -267,4 +287,34 @@ extern void	libxfs_rtmount_destroy (xfs_mount_t *);
 struct xfs_dquot {
 	int		q_type;
 };
+
+typedef struct wait_queue_head {
+} wait_queue_head_t;
+
+static inline void wake_up(wait_queue_head_t *wq) {}
+
+struct xfs_defer_drain { /* empty */ };
+
+#define xfs_defer_drain_init(dr)		((void)0)
+#define xfs_defer_drain_free(dr)		((void)0)
+
+#define xfs_perag_intent_get(mp, agno) \
+	xfs_perag_get((mp), XFS_FSB_TO_AGNO((mp), (agno)))
+#define xfs_perag_intent_put(pag)		xfs_perag_put(pag)
+
+static inline void xfs_perag_intent_hold(struct xfs_perag *pag) {}
+static inline void xfs_perag_intent_rele(struct xfs_perag *pag) {}
+
+static inline void libxfs_buftarg_drain(struct xfs_buftarg *btp)
+{
+	cache_purge(btp->bcache);
+}
+
+struct mnt_idmap {
+	/* empty */
+};
+
+/* bogus idmapping so that mkfs can do directory inheritance correctly */
+#define libxfs_nop_idmap	((struct mnt_idmap *)1)
+
 #endif	/* __XFS_MOUNT_H__ */

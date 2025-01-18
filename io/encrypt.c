@@ -7,6 +7,10 @@
 #ifdef OVERRIDE_SYSTEM_FSCRYPT_ADD_KEY_ARG
 #  define fscrypt_add_key_arg sys_fscrypt_add_key_arg
 #endif
+#ifdef OVERRIDE_SYSTEM_FSCRYPT_POLICY_V2
+#  define fscrypt_policy_v2 sys_fscrypt_policy_v2
+#  define fscrypt_get_policy_ex_arg sys_fscrypt_get_policy_ex_arg
+#endif
 #include "platform_defs.h"
 #include "command.h"
 #include "init.h"
@@ -69,26 +73,8 @@ struct fscrypt_policy_v1 {
 
 #define FSCRYPT_POLICY_V2		2
 #define FSCRYPT_KEY_IDENTIFIER_SIZE	16
-struct fscrypt_policy_v2 {
-	__u8 version;
-	__u8 contents_encryption_mode;
-	__u8 filenames_encryption_mode;
-	__u8 flags;
-	__u8 __reserved[4];
-	__u8 master_key_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE];
-};
 
 #define FSCRYPT_MAX_KEY_SIZE		64
-
-#define FS_IOC_GET_ENCRYPTION_POLICY_EX		_IOWR('f', 22, __u8[9]) /* size + version */
-struct fscrypt_get_policy_ex_arg {
-	__u64 policy_size; /* input/output */
-	union {
-		__u8 version;
-		struct fscrypt_policy_v1 v1;
-		struct fscrypt_policy_v2 v2;
-	} policy; /* output */
-};
 
 #define FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR	1
 #define FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER	2
@@ -132,6 +118,40 @@ struct fscrypt_get_key_status_arg {
 };
 
 #endif /* !FS_IOC_GET_ENCRYPTION_POLICY_EX */
+
+/*
+ * Since the log2_data_unit_size field was added later than fscrypt_policy_v2
+ * itself, we may need to override the system definition to get that field.
+ * And also fscrypt_get_policy_ex_arg since it contains fscrypt_policy_v2.
+ */
+#if !defined(FS_IOC_GET_ENCRYPTION_POLICY_EX) || \
+	defined(OVERRIDE_SYSTEM_FSCRYPT_POLICY_V2)
+#undef fscrypt_policy_v2
+struct fscrypt_policy_v2 {
+	__u8 version;
+	__u8 contents_encryption_mode;
+	__u8 filenames_encryption_mode;
+	__u8 flags;
+	__u8 log2_data_unit_size;
+	__u8 __reserved[3];
+	__u8 master_key_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE];
+};
+
+#undef fscrypt_get_policy_ex_arg
+struct fscrypt_get_policy_ex_arg {
+	__u64 policy_size; /* input/output */
+	union {
+		__u8 version;
+		struct fscrypt_policy_v1 v1;
+		struct fscrypt_policy_v2 v2;
+	} policy; /* output */
+};
+
+#endif
+
+#ifndef FS_IOC_GET_ENCRYPTION_POLICY_EX
+#  define FS_IOC_GET_ENCRYPTION_POLICY_EX		_IOWR('f', 22, __u8[9]) /* size + version */
+#endif
 
 /*
  * Since the key_id field was added later than struct fscrypt_add_key_arg
@@ -205,6 +225,7 @@ set_encpolicy_help(void)
 " -c MODE -- contents encryption mode\n"
 " -n MODE -- filenames encryption mode\n"
 " -f FLAGS -- policy flags\n"
+" -s LOG2_DUSIZE -- log2 of data unit size\n"
 " -v VERSION -- policy version\n"
 "\n"
 " MODE can be numeric or one of the following predefined values:\n"));
@@ -588,6 +609,7 @@ set_encpolicy_f(int argc, char **argv)
 	__u8 contents_encryption_mode = FSCRYPT_MODE_AES_256_XTS;
 	__u8 filenames_encryption_mode = FSCRYPT_MODE_AES_256_CTS;
 	__u8 flags = FSCRYPT_POLICY_FLAGS_PAD_16;
+	__u8 log2_data_unit_size = 0;
 	int version = -1; /* unspecified */
 	struct fscrypt_key_specifier key_spec;
 	union {
@@ -596,7 +618,7 @@ set_encpolicy_f(int argc, char **argv)
 		struct fscrypt_policy_v2 v2;
 	} policy;
 
-	while ((c = getopt(argc, argv, "c:n:f:v:")) != EOF) {
+	while ((c = getopt(argc, argv, "c:n:f:s:v:")) != EOF) {
 		switch (c) {
 		case 'c':
 			if (!parse_mode(optarg, &contents_encryption_mode)) {
@@ -619,6 +641,14 @@ set_encpolicy_f(int argc, char **argv)
 		case 'f':
 			if (!parse_byte_value(optarg, &flags)) {
 				fprintf(stderr, _("invalid flags: %s\n"),
+					optarg);
+				exitcode = 1;
+				return 0;
+			}
+			break;
+		case 's':
+			if (!parse_byte_value(optarg, &log2_data_unit_size)) {
+				fprintf(stderr, _("invalid log2_dusize: %s\n"),
 					optarg);
 				exitcode = 1;
 				return 0;
@@ -673,9 +703,16 @@ set_encpolicy_f(int argc, char **argv)
 		policy.v2.contents_encryption_mode = contents_encryption_mode;
 		policy.v2.filenames_encryption_mode = filenames_encryption_mode;
 		policy.v2.flags = flags;
+		policy.v2.log2_data_unit_size = log2_data_unit_size;
 		memcpy(policy.v2.master_key_identifier, key_spec.u.identifier,
 		       FSCRYPT_KEY_IDENTIFIER_SIZE);
 	} else {
+		if (log2_data_unit_size != 0) {
+			fprintf(stderr,
+				"v1 policy does not support selecting the data unit size\n");
+			exitcode = 1;
+			return 0;
+		}
 		/*
 		 * xfstests passes .version = 255 for testing.  Just use
 		 * 'struct fscrypt_policy_v1' for both v1 and unknown versions.
@@ -908,7 +945,7 @@ encrypt_init(void)
 	set_encpolicy_cmd.name = "set_encpolicy";
 	set_encpolicy_cmd.cfunc = set_encpolicy_f;
 	set_encpolicy_cmd.args =
-		_("[-c mode] [-n mode] [-f flags] [-v version] [keyspec]");
+		_("[-c mode] [-n mode] [-f flags] [-s log2_dusize] [-v version] [keyspec]");
 	set_encpolicy_cmd.argmin = 0;
 	set_encpolicy_cmd.argmax = -1;
 	set_encpolicy_cmd.flags = CMD_NOMAP_OK | CMD_FOREIGN_OK;

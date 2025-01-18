@@ -15,6 +15,8 @@
 #include "paths.h"
 #include "input.h"
 #include "projects.h"
+#include <mntent.h>
+#include "list.h"
 #include <limits.h>
 
 extern char *progname;
@@ -295,10 +297,6 @@ fs_cursor_next_entry(
 	return NULL;
 }
 
-
-#if defined(HAVE_GETMNTENT)
-#include <mntent.h>
-
 /*
  * Determines whether the "logdev" or "rtdev" mount options are
  * present for the given mount point.  If so, the value for each (a
@@ -417,10 +415,6 @@ fs_table_initialise_mounts(
 	return error;
 }
 
-#else
-# error "How do I extract info about mounted filesystems on this platform?"
-#endif
-
 /*
  * Given a directory, match it up to a filesystem mount point.
  */
@@ -457,7 +451,8 @@ fs_table_insert_mount(
 
 static int
 fs_table_initialise_projects(
-	char		*project)
+	char		*project,
+	bool		all_mps_initialised)
 {
 	fs_project_path_t *path;
 	fs_path_t	*fs;
@@ -473,8 +468,10 @@ fs_table_initialise_projects(
 			continue;
 		fs = fs_mount_point_from_path(path->pp_pathname);
 		if (!fs) {
-			fprintf(stderr, _("%s: cannot find mount point for path `%s': %s\n"),
-					progname, path->pp_pathname, strerror(errno));
+			if (all_mps_initialised)
+				fprintf(stderr,
+	_("%s: cannot find mount point for path `%s': %s\n"), progname,
+					path->pp_pathname, strerror(errno));
 			continue;
 		}
 		(void) fs_table_insert(path->pp_pathname, path->pp_prid,
@@ -495,11 +492,12 @@ fs_table_initialise_projects(
 
 static void
 fs_table_insert_project(
-	char		*project)
+	char		*project,
+	bool		all_mps_initialised)
 {
 	int		error;
 
-	error = fs_table_initialise_projects(project);
+	error = fs_table_initialise_projects(project, all_mps_initialised);
 	if (error)
 		fprintf(stderr, _("%s: cannot setup path for project %s: %s\n"),
 			progname, project, strerror(error));
@@ -532,9 +530,9 @@ fs_table_initialise(
 	}
 	if (project_count) {
 		for (i = 0; i < project_count; i++)
-			fs_table_insert_project(projects[i]);
+			fs_table_insert_project(projects[i], mount_count == 0);
 	} else {
-		error = fs_table_initialise_projects(NULL);
+		error = fs_table_initialise_projects(NULL, mount_count == 0);
 		if (error)
 			goto out_error;
 	}
@@ -562,4 +560,171 @@ fs_table_insert_project_path(
 		error = ENOENT;
 
 	return error;
+}
+
+/* Structured path components. */
+
+struct path_list {
+	struct list_head	p_head;
+};
+
+struct path_component {
+	struct list_head	pc_list;
+	uint64_t		pc_ino;
+	char			*pc_fname;
+};
+
+/* Initialize a path component with a given name. */
+struct path_component *
+path_component_init(
+	const char		*name,
+	uint64_t		ino)
+{
+	struct path_component	*pc;
+
+	pc = malloc(sizeof(struct path_component));
+	if (!pc)
+		return NULL;
+	INIT_LIST_HEAD(&pc->pc_list);
+	pc->pc_fname = strdup(name);
+	if (!pc->pc_fname) {
+		free(pc);
+		return NULL;
+	}
+	pc->pc_ino = ino;
+	return pc;
+}
+
+/* Free a path component. */
+void
+path_component_free(
+	struct path_component	*pc)
+{
+	free(pc->pc_fname);
+	free(pc);
+}
+
+/* Initialize a pathname or returns positive errno. */
+struct path_list *
+path_list_init(void)
+{
+	struct path_list	*path;
+
+	path = malloc(sizeof(struct path_list));
+	if (!path)
+		return NULL;
+	INIT_LIST_HEAD(&path->p_head);
+	return path;
+}
+
+/* Empty out a pathname. */
+void
+path_list_free(
+	struct path_list	*path)
+{
+	struct path_component	*pos;
+	struct path_component	*n;
+
+	list_for_each_entry_safe(pos, n, &path->p_head, pc_list) {
+		path_list_del_component(path, pos);
+		path_component_free(pos);
+	}
+	free(path);
+}
+
+/* Add a parent component to a pathname. */
+void
+path_list_add_parent_component(
+	struct path_list	*path,
+	struct path_component	*pc)
+{
+	list_add(&pc->pc_list, &path->p_head);
+}
+
+/* Add a component to a pathname. */
+void
+path_list_add_component(
+	struct path_list	*path,
+	struct path_component	*pc)
+{
+	list_add_tail(&pc->pc_list, &path->p_head);
+}
+
+/* Remove a component from a pathname. */
+void
+path_list_del_component(
+	struct path_list	*path,
+	struct path_component	*pc)
+{
+	list_del_init(&pc->pc_list);
+}
+
+/*
+ * Convert a pathname into a string or returns -1 if the buffer isn't long
+ * enough.
+ */
+ssize_t
+path_list_to_string(
+	const struct path_list	*path,
+	char			*buf,
+	size_t			buflen)
+{
+	struct path_component	*pos;
+	char			*buf_end = buf + buflen;
+	ssize_t			bytes = 0;
+	int			ret;
+
+	list_for_each_entry(pos, &path->p_head, pc_list) {
+		if (buf >= buf_end)
+			return -1;
+
+		ret = snprintf(buf, buflen, "/%s", pos->pc_fname);
+		if (ret < 0 || ret >= buflen)
+			return -1;
+
+		bytes += ret;
+		buf += ret;
+		buflen -= ret;
+	}
+	return bytes;
+}
+
+/* Walk each component of a path. */
+int
+path_walk_components(
+	const struct path_list	*path,
+	path_walk_fn_t		fn,
+	void			*arg)
+{
+	struct path_component	*pos;
+	int			ret;
+
+	list_for_each_entry(pos, &path->p_head, pc_list) {
+		ret = fn(pos->pc_fname, pos->pc_ino, arg);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* Will this path contain a loop if we add this inode? */
+bool
+path_will_loop(
+	const struct path_list	*path_list,
+	uint64_t		ino)
+{
+	struct path_component	*pc;
+	unsigned int		nr = 0;
+
+	list_for_each_entry(pc, &path_list->p_head, pc_list) {
+		if (pc->pc_ino == ino)
+			return true;
+
+		/* 256 path components should be enough for anyone. */
+		if (++nr > 256)
+			return true;
+	}
+
+	return false;
 }

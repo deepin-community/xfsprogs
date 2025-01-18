@@ -20,6 +20,7 @@ struct bt_rebuild {
 	/* Tree-specific data. */
 	union {
 		struct xfs_slab_cursor	*slab_cursor;
+		struct xfs_btree_cur	*rmapbt_cursor;
 		struct {
 			struct extent_tree_node	*bno_rec;
 			unsigned int		freeblks;
@@ -58,5 +59,8 @@ void init_refc_cursor(struct repair_ctx *sc, struct xfs_perag *pag,
 		unsigned int free_space, struct bt_rebuild *btr);
 void build_refcount_tree(struct repair_ctx *sc, xfs_agnumber_t agno,
 		struct bt_rebuild *btr);
+
+xfs_extlen_t estimate_agbtree_blocks(struct xfs_perag *pag,
+		unsigned int free_extents);
 
 #endif /* __XFS_REPAIR_AG_BTREE_H__ */

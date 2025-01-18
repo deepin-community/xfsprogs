@@ -18,7 +18,12 @@ bitmap.c \
 bulkstat.c \
 convert.c \
 crc32.c \
+file_exchange.c \
 fsgeom.c \
+fsproperties.c \
+fsprops.c \
+getparents.c \
+histogram.c \
 list_sort.c \
 linux.c \
 logging.c \
@@ -26,6 +31,7 @@ paths.c \
 projects.c \
 ptvar.c \
 radix-tree.c \
+randbytes.c \
 scrub.c \
 util.c \
 workqueue.c
@@ -39,40 +45,35 @@ crc32c.h \
 crc32cselftest.h \
 crc32defs.h \
 crc32table.h \
+dahashselftest.h \
+div64.h \
+fakelibattr.h \
+file_exchange.h \
 fsgeom.h \
+fsproperties.h \
+fsprops.h \
+getparents.h \
+histogram.h \
 logging.h \
 paths.h \
 projects.h \
 ptvar.h \
 radix-tree.h \
+randbytes.h \
 scrub.h \
 workqueue.h
 
 LSRCFILES += gen_crc32table.c
 
-ifeq ($(HAVE_GETMNTENT),yes)
-LCFLAGS += -DHAVE_GETMNTENT
-endif
+LDIRT = gen_crc32table crc32table.h
 
-LDIRT = gen_crc32table crc32table.h crc32selftest
-
-default: crc32selftest ltdepend $(LTLIBRARY)
+default: ltdepend $(LTLIBRARY)
 
 crc32table.h: gen_crc32table.c crc32defs.h
 	@echo "    [CC]     gen_crc32table"
 	$(Q) $(BUILD_CC) $(BUILD_CFLAGS) -o gen_crc32table $<
 	@echo "    [GENERATE] $@"
 	$(Q) ./gen_crc32table > crc32table.h
-
-# The selftest binary will return an error if it fails. This is made a
-# dependency of the build process so that we refuse to build the tools on broken
-# systems/architectures. Hence we make sure that xfsprogs will never use a
-# busted CRC calculation at build time and hence avoid putting bad CRCs down on
-# disk.
-crc32selftest: gen_crc32table.c crc32table.h crc32.c crc32defs.h
-	@echo "    [TEST]    CRC32"
-	$(Q) $(BUILD_CC) $(BUILD_CFLAGS) -D CRC32_SELFTEST=1 crc32.c -o $@
-	$(Q) ./$@
 
 include $(BUILDRULES)
 

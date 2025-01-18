@@ -20,26 +20,13 @@ typedef struct bmap_ext {
  * Block map.
  */
 typedef	struct blkmap {
-	int		naexts;
-	int		nexts;
+	xfs_extnum_t	naexts;
+	xfs_extnum_t	nexts;
 	bmap_ext_t	exts[1];
 } blkmap_t;
 
 #define	BLKMAP_SIZE(n)	\
 	(offsetof(blkmap_t, exts) + (sizeof(bmap_ext_t) * (n)))
-
-/*
- * For 32 bit platforms, we are limited to extent arrays of 2^31 bytes, which
- * limits the number of extents in an inode we can check. If we don't limit the
- * valid range, we can overflow the BLKMAP_SIZE() calculation and allocate less
- * memory than we think we needed, and hence walk off the end of the array and
- * corrupt memory.
- */
-#if BITS_PER_LONG == 32
-#define BLKMAP_NEXTS_MAX	((INT_MAX / sizeof(bmap_ext_t)) - 1)
-#else
-#define BLKMAP_NEXTS_MAX	INT_MAX
-#endif
 
 extern pthread_key_t dblkmap_key;
 extern pthread_key_t ablkmap_key;
@@ -56,6 +43,7 @@ int		blkmap_getn(blkmap_t *blkmap, xfs_fileoff_t o,
 			    xfs_filblks_t nb, bmap_ext_t **bmpp,
 			    bmap_ext_t *bmpp_single);
 xfs_fileoff_t	blkmap_last_off(blkmap_t *blkmap);
-xfs_fileoff_t	blkmap_next_off(blkmap_t *blkmap, xfs_fileoff_t o, int *t);
+xfs_fileoff_t	blkmap_next_off(blkmap_t *blkmap, xfs_fileoff_t o,
+				xfs_extnum_t *t);
 
 #endif /* _XFS_REPAIR_BMAP_H */

@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #ifndef XFS_SCRUB_COMMON_H_
 #define XFS_SCRUB_COMMON_H_
@@ -73,14 +73,6 @@ double auto_space_units(unsigned long long kilobytes, char **units);
 double auto_units(unsigned long long number, char **units, int *precision);
 unsigned int scrub_nproc(struct scrub_ctx *ctx);
 unsigned int scrub_nproc_workqueue(struct scrub_ctx *ctx);
-
-#ifndef HAVE_SYNCFS
-static inline int syncfs(int fd)
-{
-	sync();
-	return 0;
-}
-#endif
 
 void background_sleep(void);
 char *string_escape(const char *in);

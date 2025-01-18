@@ -7,6 +7,13 @@
 #ifndef __LIBXFS_H__
 #define __LIBXFS_H__
 
+/* CONFIG_XFS_* must be defined to 1 to work with IS_ENABLED() */
+
+/* For userspace XFS_RT is always defined */
+#define CONFIG_XFS_RT 1
+/* Ditto in-memory btrees */
+#define CONFIG_XFS_BTREE_IN_MEM 1
+
 #include "libxfs_api_defs.h"
 #include "platform_defs.h"
 #include "xfs.h"
@@ -17,6 +24,8 @@
 #include "bitops.h"
 #include "kmem.h"
 #include "libfrog/radix-tree.h"
+#include "libfrog/bitmask.h"
+#include "libfrog/div64.h"
 #include "atomic.h"
 #include "spinlock.h"
 
@@ -42,6 +51,7 @@ struct iomap;
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
 #define unlikely(x) (x)
+#define likely(x) (x)
 
 /*
  * This mirrors the kernel include for xfs_buf.h - it's implicitly included in
@@ -66,6 +76,7 @@ struct iomap;
 #include "xfs_attr_sf.h"
 #include "xfs_inode_fork.h"
 #include "xfs_inode_buf.h"
+#include "xfs_inode_util.h"
 #include "xfs_alloc.h"
 #include "xfs_btree.h"
 #include "xfs_bmap.h"
@@ -77,6 +88,13 @@ struct iomap;
 #include "xfs_refcount_btree.h"
 #include "xfs_refcount.h"
 #include "xfs_btree_staging.h"
+#include "xfs_rtbitmap.h"
+#include "xfs_symlink_remote.h"
+#include "libxfs/xfile.h"
+#include "libxfs/buf_mem.h"
+#include "xfs_btree_mem.h"
+#include "xfs_parent.h"
+#include "xfs_ag_resv.h"
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -88,60 +106,58 @@ struct iomap;
 
 #define xfs_isset(a,i)	((a)[(i)/(sizeof(*(a))*NBBY)] & (1ULL<<((i)%(sizeof(*(a))*NBBY))))
 
+struct libxfs_dev {
+	/* input parameters */
+	char		*name;	/* pathname of the device */
+	bool		isfile;	/* is the device a file? */
+	bool		create;	/* create file if it doesn't exist */
+
+	/* output parameters */
+	dev_t		dev;	/* device name for the device */
+	long long       size;	/* size of subvolume (BBs) */
+	int		bsize;	/* device blksize */
+	int		fd;	/* file descriptor */
+};
+
 /*
  * Argument structure for libxfs_init().
  */
-typedef struct libxfs_xinit {
-				/* input parameters */
-	char            *volname;       /* pathname of volume */
-	char            *dname;         /* pathname of data "subvolume" */
-	char            *logname;       /* pathname of log "subvolume" */
-	char            *rtname;        /* pathname of realtime "subvolume" */
-	int             isreadonly;     /* filesystem is only read in applic */
-	int             isdirect;       /* we can attempt to use direct I/O */
-	int             disfile;        /* data "subvolume" is a regular file */
-	int             dcreat;         /* try to create data subvolume */
-	int             lisfile;        /* log "subvolume" is a regular file */
-	int             lcreat;         /* try to create log subvolume */
-	int             risfile;        /* realtime "subvolume" is a reg file */
-	int             rcreat;         /* try to create realtime subvolume */
-	int		setblksize;	/* attempt to set device blksize */
-	int		usebuflock;	/* lock xfs_buf's - for MT usage */
-				/* output results */
-	dev_t           ddev;           /* device for data subvolume */
-	dev_t           logdev;         /* device for log subvolume */
-	dev_t           rtdev;          /* device for realtime subvolume */
-	long long       dsize;          /* size of data subvolume (BBs) */
-	long long       logBBsize;      /* size of log subvolume (BBs) */
-					/* (blocks allocated for use as
-					 * log is stored in mount structure) */
-	long long       logBBstart;     /* start block of log subvolume (BBs) */
-	long long       rtsize;         /* size of realtime subvolume (BBs) */
-	int		dbsize;		/* data subvolume device blksize */
-	int		lbsize;		/* log subvolume device blksize */
-	int		rtbsize;	/* realtime subvolume device blksize */
-	int             dfd;            /* data subvolume file descriptor */
-	int             logfd;          /* log subvolume file descriptor */
-	int             rtfd;           /* realtime subvolume file descriptor */
-	int		icache_flags;	/* cache init flags */
-	int		bcache_flags;	/* cache init flags */
-} libxfs_init_t;
+struct libxfs_init {
+	struct libxfs_dev	data;
+	struct libxfs_dev	log;
+	struct libxfs_dev	rt;
 
-#define LIBXFS_ISREADONLY	0x0002	/* disallow all mounted filesystems */
-#define LIBXFS_ISINACTIVE	0x0004	/* allow mounted only if mounted ro */
-#define LIBXFS_DANGEROUSLY	0x0008	/* repairing a device mounted ro    */
-#define LIBXFS_EXCLUSIVELY	0x0010	/* disallow other accesses (O_EXCL) */
-#define LIBXFS_DIRECT		0x0020	/* can use direct I/O, not buffered */
+	/* input parameters */
+	unsigned	flags;		/* LIBXFS_* flags below */
+	int		bcache_flags;	/* cache init flags */
+	int		setblksize;	/* value to set device blksizes to */
+};
+
+/* disallow all mounted filesystems: */
+#define LIBXFS_ISREADONLY	(1U << 0)
+
+/* allow mounted only if mounted ro: */
+#define LIBXFS_ISINACTIVE	(1U << 1)
+
+/* repairing a device mounted ro: */
+#define LIBXFS_DANGEROUSLY	(1U << 2)
+
+/* disallow other accesses (O_EXCL): */
+#define LIBXFS_EXCLUSIVELY	(1U << 3)
+
+/* can use direct I/O, not buffered: */
+#define LIBXFS_DIRECT		(1U << 4)
+
+/* lock xfs_buf's - for MT usage */
+#define LIBXFS_USEBUFLOCK	(1U << 5)
 
 extern char	*progname;
 extern xfs_lsn_t libxfs_max_lsn;
-extern int	libxfs_init (libxfs_init_t *);
-void		libxfs_destroy(struct libxfs_xinit *li);
-extern int	libxfs_device_to_fd (dev_t);
-extern dev_t	libxfs_device_open (char *, int, int, int);
-extern void	libxfs_device_close (dev_t);
+
+int		libxfs_init(struct libxfs_init *);
+void		libxfs_destroy(struct libxfs_init *li);
+
 extern int	libxfs_device_alignment (void);
-extern void	libxfs_report(FILE *);
 
 /* check or write log footer: specify device, log size in blocks & uuid */
 typedef char	*(libxfs_get_block_t)(char *, int, void *);
@@ -208,11 +224,6 @@ libxfs_bmbt_disk_get_all(
 	else
 		irec->br_state = XFS_EXT_NORM;
 }
-
-/* XXX: this is clearly a bug - a shared header needs to export this */
-/* xfs_rtalloc.c */
-int libxfs_rtfree_extent(struct xfs_trans *, xfs_rtblock_t, xfs_extlen_t);
-bool libxfs_verify_rtbno(struct xfs_mount *mp, xfs_rtblock_t rtbno);
 
 #include "xfs_attr.h"
 #include "topology.h"

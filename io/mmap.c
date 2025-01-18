@@ -16,9 +16,7 @@ static cmdinfo_t mread_cmd;
 static cmdinfo_t msync_cmd;
 static cmdinfo_t munmap_cmd;
 static cmdinfo_t mwrite_cmd;
-#ifdef HAVE_MREMAP
 static cmdinfo_t mremap_cmd;
-#endif /* HAVE_MREMAP */
 
 mmap_region_t	*maptable;
 int		mapcount;
@@ -46,8 +44,11 @@ print_mapping(
 	for (i = 0, p = pflags; p->prot != PROT_NONE; i++, p++)
 		buffer[i] = (map->prot & p->prot) ? p->mode : '-';
 
-	if (map->map_sync)
+#ifdef HAVE_MAP_SYNC
+	if ((map->flags & (MAP_SYNC | MAP_SHARED_VALIDATE)) ==
+			  (MAP_SYNC | MAP_SHARED_VALIDATE))
 		sprintf(&buffer[i], " S");
+#endif
 
 	printf("%c%03d%c 0x%lx - 0x%lx %s  %14s (%lld : %ld)\n",
 		braces? '[' : ' ', index, braces? ']' : ' ',
@@ -60,11 +61,11 @@ print_mapping(
 void *
 check_mapping_range(
 	mmap_region_t	*map,
-	off64_t		offset,
+	off_t		offset,
 	size_t		length,
 	int		pagealign)
 {
-	off64_t		relative;
+	off_t		relative;
 
 	if (offset < mapping->offset) {
 		printf(_("offset (%lld) is before start of mapping (%lld)\n"),
@@ -139,7 +140,9 @@ mmap_help(void)
 " -r -- map with PROT_READ protection\n"
 " -w -- map with PROT_WRITE protection\n"
 " -x -- map with PROT_EXEC protection\n"
+#ifdef HAVE_MAP_SYNC
 " -S -- map with MAP_SYNC and MAP_SHARED_VALIDATE flags\n"
+#endif
 " -s <size> -- first do mmap(size)/munmap(size), try to reserve some free space\n"
 " If no protection mode is specified, all are used by default.\n"
 "\n"));
@@ -150,7 +153,8 @@ mmap_f(
 	int		argc,
 	char		**argv)
 {
-	off64_t		offset;
+	off_t		offset;
+
 	ssize_t		length = 0, length2 = 0;
 	void		*address = NULL;
 	char		*filename;
@@ -193,18 +197,14 @@ mmap_f(
 			prot |= PROT_EXEC;
 			break;
 		case 'S':
+#ifdef HAVE_MAP_SYNC
 			flags = MAP_SYNC | MAP_SHARED_VALIDATE;
-
-			/*
-			 * If MAP_SYNC and MAP_SHARED_VALIDATE aren't defined
-			 * in the system headers we will have defined them
-			 * both as 0.
-			 */
-			if (!flags) {
-				printf("MAP_SYNC not supported\n");
-				return 0;
-			}
 			break;
+#else
+			printf("MAP_SYNC not supported\n");
+			exitcode = 1;
+			return command_usage(&mmap_cmd);
+#endif
 		case 's':
 			length2 = cvtnum(blocksize, sectsize, optarg);
 			break;
@@ -281,7 +281,7 @@ mmap_f(
 	mapping->offset = offset;
 	mapping->name = filename;
 	mapping->prot = prot;
-	mapping->map_sync = (flags == (MAP_SYNC | MAP_SHARED_VALIDATE));
+	mapping->flags = flags;
 	return 0;
 }
 
@@ -307,7 +307,7 @@ msync_f(
 	int		argc,
 	char		**argv)
 {
-	off64_t		offset;
+	off_t		offset;
 	ssize_t		length;
 	void		*start;
 	int		c, flags = 0;
@@ -400,7 +400,7 @@ mread_f(
 	int		argc,
 	char		**argv)
 {
-	off64_t		offset, tmp, dumpoffset, printoffset;
+	off_t		offset, tmp, dumpoffset, printoffset;
 	ssize_t		length;
 	size_t		dumplen, cnt = 0;
 	char		*bp;
@@ -471,34 +471,26 @@ mread_f(
 		dumplen = pagesize;
 
 	if (rflag) {
-		for (tmp = length - 1, c = 0; tmp >= 0; tmp--, c = 1) {
-			*bp = *(((char *)mapping->addr) + dumpoffset + tmp);
-			cnt++;
-			if (c && cnt == dumplen) {
+		for (tmp = length - 1; tmp >= 0; tmp--) {
+			bp[cnt++] = ((char *)mapping->addr)[dumpoffset + tmp];
+			if (cnt == dumplen) {
 				if (dump) {
 					dump_buffer(printoffset, dumplen);
 					printoffset += dumplen;
 				}
-				bp = (char *)io_buffer;
 				dumplen = pagesize;
 				cnt = 0;
-			} else {
-				bp++;
 			}
 		}
 	} else {
-		for (tmp = 0, c = 0; tmp < length; tmp++, c = 1) {
-			*bp = *(((char *)mapping->addr) + dumpoffset + tmp);
-			cnt++;
-			if (c && cnt == dumplen) {
+		for (tmp = 0; tmp < length; tmp++) {
+			bp[cnt++] = ((char *)mapping->addr)[dumpoffset + tmp];
+			if (cnt == dumplen) {
 				if (dump)
 					dump_buffer(printoffset + tmp -
 						(dumplen - 1), dumplen);
-				bp = (char *)io_buffer;
 				dumplen = pagesize;
 				cnt = 0;
-			} else {
-				bp++;
 			}
 		}
 	}
@@ -565,7 +557,7 @@ mwrite_f(
 	int		argc,
 	char		**argv)
 {
-	off64_t		offset, tmp;
+	off_t		offset, tmp;
 	ssize_t		length;
 	void		*start;
 	char		*sp;
@@ -635,7 +627,6 @@ mwrite_f(
 	return 0;
 }
 
-#ifdef HAVE_MREMAP
 static void
 mremap_help(void)
 {
@@ -711,7 +702,6 @@ mremap_f(
 	mapping->length = new_length;
 	return 0;
 }
-#endif /* HAVE_MREMAP */
 
 void
 mmap_init(void)
@@ -768,7 +758,6 @@ mmap_init(void)
 		_("writes data into a region in the current memory mapping");
 	mwrite_cmd.help = mwrite_help;
 
-#ifdef HAVE_MREMAP
 	mremap_cmd.name = "mremap";
 	mremap_cmd.altname = "mrm";
 	mremap_cmd.cfunc = mremap_f;
@@ -779,14 +768,11 @@ mmap_init(void)
 	mremap_cmd.oneline =
 		_("alters the size of the current memory mapping");
 	mremap_cmd.help = mremap_help;
-#endif /* HAVE_MREMAP */
 
 	add_command(&mmap_cmd);
 	add_command(&mread_cmd);
 	add_command(&msync_cmd);
 	add_command(&munmap_cmd);
 	add_command(&mwrite_cmd);
-#ifdef HAVE_MREMAP
 	add_command(&mremap_cmd);
-#endif /* HAVE_MREMAP */
 }

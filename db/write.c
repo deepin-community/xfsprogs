@@ -88,7 +88,7 @@ write_f(
 	struct xfs_buf_ops local_ops;
 	const struct xfs_buf_ops *stashed_ops = NULL;
 
-	if (x.isreadonly & LIBXFS_ISREADONLY) {
+	if (x.flags & LIBXFS_ISREADONLY) {
 		dbprintf(_("%s started in read only mode, writing disabled\n"),
 			progname);
 		return 0;
@@ -479,7 +479,7 @@ convert_oct(
 		if (arg[count] == '\0')
 			break;
 
-		if ((arg[count] < '0') && (arg[count] > '7'))
+		if ((arg[count] < '0') || (arg[count] > '7'))
 			break;
 	}
 
@@ -553,7 +553,7 @@ convert_arg(
 
 			/* do octal conversion */
 			if (*ostr == '\\') {
-				if (*(ostr + 1) >= '0' || *(ostr + 1) <= '7') {
+				if (*(ostr + 1) >= '0' && *(ostr + 1) <= '7') {
 					ret = convert_oct(ostr + 1, &octval);
 					*rbuf++ = octval;
 					ostr += ret + 1;

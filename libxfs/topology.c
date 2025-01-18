@@ -6,9 +6,7 @@
 
 #include "libxfs_priv.h"
 #include "libxcmd.h"
-#ifdef ENABLE_BLKID
-#  include <blkid/blkid.h>
-#endif /* ENABLE_BLKID */
+#include <blkid/blkid.h>
 #include "xfs_multidisk.h"
 #include "libfrog/platform.h"
 
@@ -96,7 +94,6 @@ done:
  *	 0 for nothing found
  *	-1 for internal error
  */
-#ifdef ENABLE_BLKID
 int
 check_overwrite(
 	const char	*device)
@@ -173,27 +170,14 @@ out:
 	return ret;
 }
 
-static void blkid_get_topology(
-	const char	*device,
-	int		*sunit,
-	int		*swidth,
-	int		*lsectorsize,
-	int		*psectorsize,
-	int		force_overwrite)
+static void
+blkid_get_topology(
+	const char		*device,
+	struct device_topology	*dt,
+	int			force_overwrite)
 {
-
 	blkid_topology tp;
 	blkid_probe pr;
-	unsigned long val;
-	struct stat statbuf;
-
-	/* can't get topology info from a file */
-	if (!stat(device, &statbuf) && S_ISREG(statbuf.st_mode)) {
-		fprintf(stderr,
-	_("%s: Warning: trying to probe topology of a file %s!\n"),
-			progname, device);
-		return;
-	}
 
 	pr = blkid_new_probe_from_filename(device);
 	if (!pr)
@@ -203,31 +187,28 @@ static void blkid_get_topology(
 	if (!tp)
 		goto out_free_probe;
 
-	val = blkid_topology_get_logical_sector_size(tp);
-	*lsectorsize = val;
-	val = blkid_topology_get_physical_sector_size(tp);
-	*psectorsize = val;
-	val = blkid_topology_get_minimum_io_size(tp);
-	*sunit = val;
-	val = blkid_topology_get_optimal_io_size(tp);
-	*swidth = val;
+	dt->logical_sector_size = blkid_topology_get_logical_sector_size(tp);
+	dt->physical_sector_size = blkid_topology_get_physical_sector_size(tp);
+	dt->sunit = blkid_topology_get_minimum_io_size(tp);
+	dt->swidth = blkid_topology_get_optimal_io_size(tp);
 
 	/*
 	 * If the reported values are the same as the physical sector size
 	 * do not bother to report anything.  It will only cause warnings
 	 * if people specify larger stripe units or widths manually.
 	 */
-	if (*sunit == *psectorsize || *swidth == *psectorsize) {
-		*sunit = 0;
-		*swidth = 0;
+	if (dt->sunit == dt->physical_sector_size ||
+	    dt->swidth == dt->physical_sector_size) {
+		dt->sunit = 0;
+		dt->swidth = 0;
 	}
 
 	/*
 	 * Blkid reports the information in terms of bytes, but we want it in
 	 * terms of 512 bytes blocks (only to convert it to bytes later..)
 	 */
-	*sunit = *sunit >> 9;
-	*swidth = *swidth >> 9;
+	dt->sunit >>= 9;
+	dt->swidth >>= 9;
 
 	if (blkid_topology_get_alignment_offset(tp) != 0) {
 		fprintf(stderr,
@@ -241,7 +222,7 @@ static void blkid_get_topology(
 			exit(EXIT_FAILURE);
 		}
 		/* Do not use physical sector size if the device is misaligned */
-		*psectorsize = *lsectorsize;
+		dt->physical_sector_size = dt->logical_sector_size;
 	}
 
 	blkid_free_probe(pr);
@@ -253,79 +234,63 @@ out_free_probe:
 		_("warning: unable to probe device topology for device %s\n"),
 		device);
 }
-#else /* ifdef ENABLE_BLKID */
-/*
- * Without blkid, we can't do a good check for signatures.
- * So instead of some messy attempts, just disable any checks
- * and always return 'nothing found'.
- */
-#  warning BLKID is disabled, so signature detection and block device\
- access are not working!
-int
-check_overwrite(
-	const char	*device)
-{
-	return 1;
-}
 
-static void blkid_get_topology(
-	const char	*device,
-	int		*sunit,
-	int		*swidth,
-	int		*lsectorsize,
-	int		*psectorsize,
-	int		force_overwrite)
-{
-	/*
-	 * Shouldn't make any difference (no blkid = no block device access),
-	 * but make sure this dummy replacement returns with at least some
-	 * sanity.
-	 */
-	*lsectorsize = *psectorsize = 512;
-}
-
-#endif /* ENABLE_BLKID */
-
-void get_topology(
-	libxfs_init_t		*xi,
-	struct fs_topology	*ft,
+static void
+get_device_topology(
+	struct libxfs_dev	*dev,
+	struct device_topology	*dt,
 	int			force_overwrite)
 {
-	struct stat statbuf;
-	char *dfile = xi->volname ? xi->volname : xi->dname;
+	struct stat		st;
+
+	/*
+	 * Nothing to do if this particular subvolume doesn't exist.
+	 */
+	if (!dev->name)
+		return;
 
 	/*
 	 * If our target is a regular file, use platform_findsizes
 	 * to try to obtain the underlying filesystem's requirements
 	 * for direct IO; we'll set our sector size to that if possible.
 	 */
-	if (xi->disfile ||
-	    (!stat(dfile, &statbuf) && S_ISREG(statbuf.st_mode))) {
-		int fd;
+	if (dev->isfile || (!stat(dev->name, &st) && S_ISREG(st.st_mode))) {
 		int flags = O_RDONLY;
 		long long dummy;
+		int fd;
 
 		/* with xi->disfile we may not have the file yet! */
-		if (xi->disfile)
+		if (dev->isfile)
 			flags |= O_CREAT;
 
-		fd = open(dfile, flags, 0666);
+		fd = open(dev->name, flags, 0666);
 		if (fd >= 0) {
-			platform_findsizes(dfile, fd, &dummy, &ft->lsectorsize);
+			platform_findsizes(dev->name, fd, &dummy,
+					&dt->logical_sector_size);
 			close(fd);
-			ft->psectorsize = ft->lsectorsize;
-		} else
-			ft->psectorsize = ft->lsectorsize = BBSIZE;
+		} else {
+			dt->logical_sector_size = BBSIZE;
+		}
 	} else {
-		blkid_get_topology(dfile, &ft->dsunit, &ft->dswidth,
-				   &ft->lsectorsize, &ft->psectorsize,
-				   force_overwrite);
+		blkid_get_topology(dev->name, dt, force_overwrite);
 	}
 
-	if (xi->rtname && !xi->risfile) {
-		int sunit, lsectorsize, psectorsize;
+	ASSERT(dt->logical_sector_size);
 
-		blkid_get_topology(xi->rtname, &sunit, &ft->rtswidth,
-				   &lsectorsize, &psectorsize, force_overwrite);
-	}
+	/*
+	 * Older kernels may not have physical/logical distinction.
+	 */
+	if (!dt->physical_sector_size)
+		dt->physical_sector_size = dt->logical_sector_size;
+}
+
+void
+get_topology(
+	struct libxfs_init	*xi,
+	struct fs_topology	*ft,
+	int			force_overwrite)
+{
+	get_device_topology(&xi->data, &ft->data, force_overwrite);
+	get_device_topology(&xi->rt, &ft->rt, force_overwrite);
+	get_device_topology(&xi->log, &ft->log, force_overwrite);
 }

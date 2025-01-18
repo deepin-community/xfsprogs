@@ -18,14 +18,9 @@
 #include "dinode.h"
 #include "progress.h"
 #include "versions.h"
+#include "repair/pptr.h"
 
-static struct cred		zerocr;
-static struct fsxattr 		zerofsx;
 static xfs_ino_t		orphanage_ino;
-
-static struct xfs_name		xfs_name_dot = {(unsigned char *)".",
-						1,
-						XFS_DIR3_FT_DIR};
 
 /*
  * Data structures used to keep track of directories where the ".."
@@ -151,9 +146,10 @@ dir_read_buf(
 }
 
 /*
- * Returns 0 if the name already exists (ie. a duplicate)
+ * Returns inode number of original file if the name already exists
+ * (ie. a duplicate)
  */
-static int
+static xfs_ino_t
 dir_hash_add(
 	struct xfs_mount	*mp,
 	struct dir_hash_tab	*hashtab,
@@ -166,7 +162,7 @@ dir_hash_add(
 	xfs_dahash_t		hash = 0;
 	int			byhash = 0;
 	struct dir_hash_ent	*p;
-	int			dup;
+	xfs_ino_t		dup_inum;
 	short			junk;
 	struct xfs_name		xname;
 	int			error;
@@ -176,7 +172,7 @@ dir_hash_add(
 	xname.type = ftype;
 
 	junk = name[0] == '/';
-	dup = 0;
+	dup_inum = NULLFSINO;
 
 	if (!junk) {
 		hash = libxfs_dir2_hashname(mp, &xname);
@@ -188,7 +184,7 @@ dir_hash_add(
 		for (p = hashtab->byhash[byhash]; p; p = p->nextbyhash) {
 			if (p->hashval == hash && p->name.len == namelen) {
 				if (memcmp(p->name.name, name, namelen) == 0) {
-					dup = 1;
+					dup_inum = p->inum;
 					junk = 1;
 					break;
 				}
@@ -234,7 +230,7 @@ dir_hash_add(
 	p->name.name = p->namebuf;
 	p->name.len = namelen;
 	p->name.type = ftype;
-	return !dup;
+	return dup_inum;
 }
 
 /* Mark an existing directory hashtable entry as junk. */
@@ -451,136 +447,40 @@ res_failed(
 		do_error(_("xfs_trans_reserve returned %d\n"), err);
 }
 
-static inline void
-reset_inode_fields(struct xfs_inode *ip)
+/*
+ * Forcibly reinitialize a file that is a child of the superblock and has a
+ * statically defined inumber.  These files are the root of a directory tree or
+ * the realtime free space inodes.  The inode must not otherwise be in use; the
+ * data fork must be empty, and the attr fork will be reset.
+ */
+static void
+reset_sbroot_ino(
+	struct xfs_trans	*tp,
+	umode_t			mode,
+	struct xfs_inode	*ip)
 {
-	ip->i_projid = 0;
-	ip->i_disk_size = 0;
-	ip->i_nblocks = 0;
-	ip->i_extsize = 0;
-	ip->i_cowextsize = 0;
-	ip->i_flushiter = 0;
+	struct xfs_icreate_args	args = {
+		.idmap		= libxfs_nop_idmap,
+		.mode		= mode,
+		/* Root directories cannot be linked to a parent. */
+		.flags		= XFS_ICREATE_UNLINKABLE,
+	};
+
+	/* Erase the attr fork since libxfs_inode_init won't do it for us. */
 	ip->i_forkoff = 0;
-	ip->i_diflags = 0;
-	ip->i_diflags2 = 0;
-	ip->i_crtime.tv_sec = 0;
-	ip->i_crtime.tv_nsec = 0;
+	libxfs_ifork_zap_attr(ip);
+
+	libxfs_trans_ijoin(tp, ip, 0);
+	libxfs_inode_init(tp, &args, ip);
 }
 
 static void
-mk_rbmino(xfs_mount_t *mp)
+mk_rbmino(
+	struct xfs_mount	*mp)
 {
-	xfs_trans_t	*tp;
-	xfs_inode_t	*ip;
-	xfs_bmbt_irec_t	*ep;
-	int		i;
-	int		nmap;
-	int		error;
-	xfs_fileoff_t	bno;
-	xfs_bmbt_irec_t	map[XFS_BMAP_MAX_NMAP];
-	int		times;
-	uint		blocks;
-
-	/*
-	 * first set up inode
-	 */
-	i = -libxfs_trans_alloc_rollable(mp, 10, &tp);
-	if (i)
-		res_failed(i);
-
-	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rbmino, 0, &ip);
-	if (error) {
-		do_error(
-		_("couldn't iget realtime bitmap inode -- error - %d\n"),
-			error);
-	}
-
-	reset_inode_fields(ip);
-
-	VFS_I(ip)->i_mode = S_IFREG;
-	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
-	if (ip->i_afp)
-		ip->i_afp->if_format = XFS_DINODE_FMT_EXTENTS;
-
-	set_nlink(VFS_I(ip), 1);	/* account for sb ptr */
-
-	times = XFS_ICHGTIME_CHG | XFS_ICHGTIME_MOD;
-	if (xfs_has_v3inodes(mp)) {
-		VFS_I(ip)->i_version = 1;
-		ip->i_diflags2 = 0;
-		times |= XFS_ICHGTIME_CREATE;
-	}
-	libxfs_trans_ichgtime(tp, ip, times);
-
-	/*
-	 * now the ifork
-	 */
-	ip->i_df.if_bytes = 0;
-	ip->i_df.if_u1.if_root = NULL;
-
-	ip->i_disk_size = mp->m_sb.sb_rbmblocks * mp->m_sb.sb_blocksize;
-
-	/*
-	 * commit changes
-	 */
-	libxfs_trans_ijoin(tp, ip, 0);
-	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-	error = -libxfs_trans_commit(tp);
-	if (error)
-		do_error(_("%s: commit failed, error %d\n"), __func__, error);
-
-	/*
-	 * then allocate blocks for file and fill with zeroes (stolen
-	 * from mkfs)
-	 */
-	blocks = mp->m_sb.sb_rbmblocks +
-			XFS_BM_MAXLEVELS(mp, XFS_DATA_FORK) - 1;
-	error = -libxfs_trans_alloc_rollable(mp, blocks, &tp);
-	if (error)
-		res_failed(error);
-
-	libxfs_trans_ijoin(tp, ip, 0);
-	bno = 0;
-	while (bno < mp->m_sb.sb_rbmblocks) {
-		nmap = XFS_BMAP_MAX_NMAP;
-		error = -libxfs_bmapi_write(tp, ip, bno,
-			  (xfs_extlen_t)(mp->m_sb.sb_rbmblocks - bno),
-			  0, mp->m_sb.sb_rbmblocks, map, &nmap);
-		if (error) {
-			do_error(
-			_("couldn't allocate realtime bitmap, error = %d\n"),
-				error);
-		}
-		for (i = 0, ep = map; i < nmap; i++, ep++) {
-			libxfs_device_zero(mp->m_ddev_targp,
-				XFS_FSB_TO_DADDR(mp, ep->br_startblock),
-				XFS_FSB_TO_BB(mp, ep->br_blockcount));
-			bno += ep->br_blockcount;
-		}
-	}
-	error = -libxfs_trans_commit(tp);
-	if (error) {
-		do_error(
-		_("allocation of the realtime bitmap failed, error = %d\n"),
-			error);
-	}
-	libxfs_irele(ip);
-}
-
-static int
-fill_rbmino(xfs_mount_t *mp)
-{
-	struct xfs_buf	*bp;
-	xfs_trans_t	*tp;
-	xfs_inode_t	*ip;
-	xfs_rtword_t	*bmp;
-	int		nmap;
-	int		error;
-	xfs_fileoff_t	bno;
-	xfs_bmbt_irec_t	map;
-
-	bmp = btmcompute;
-	bno = 0;
+	struct xfs_trans	*tp;
+	struct xfs_inode	*ip;
+	int			error;
 
 	error = -libxfs_trans_alloc_rollable(mp, 10, &tp);
 	if (error)
@@ -593,140 +493,82 @@ fill_rbmino(xfs_mount_t *mp)
 			error);
 	}
 
-	while (bno < mp->m_sb.sb_rbmblocks)  {
-		/*
-		 * fill the file one block at a time
-		 */
-		nmap = 1;
-		error = -libxfs_bmapi_write(tp, ip, bno, 1, 0, 1, &map, &nmap);
-		if (error || nmap != 1) {
-			do_error(
-	_("couldn't map realtime bitmap block %" PRIu64 ", error = %d\n"),
-				bno, error);
-		}
-
-		ASSERT(map.br_startblock != HOLESTARTBLOCK);
-
-		error = -libxfs_trans_read_buf(
-				mp, tp, mp->m_dev,
-				XFS_FSB_TO_DADDR(mp, map.br_startblock),
-				XFS_FSB_TO_BB(mp, 1), 1, &bp, NULL);
-
-		if (error) {
-			do_warn(
-_("can't access block %" PRIu64 " (fsbno %" PRIu64 ") of realtime bitmap inode %" PRIu64 "\n"),
-				bno, map.br_startblock, mp->m_sb.sb_rbmino);
-			return(1);
-		}
-
-		memmove(bp->b_addr, bmp, mp->m_sb.sb_blocksize);
-
-		libxfs_trans_log_buf(tp, bp, 0, mp->m_sb.sb_blocksize - 1);
-
-		bmp = (xfs_rtword_t *)((intptr_t) bmp + mp->m_sb.sb_blocksize);
-		bno++;
-	}
-
-	libxfs_trans_ijoin(tp, ip, 0);
+	/* Reset the realtime bitmap inode. */
+	reset_sbroot_ino(tp, S_IFREG, ip);
+	ip->i_disk_size = mp->m_sb.sb_rbmblocks * mp->m_sb.sb_blocksize;
+	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 	error = -libxfs_trans_commit(tp);
 	if (error)
 		do_error(_("%s: commit failed, error %d\n"), __func__, error);
 	libxfs_irele(ip);
-	return(0);
 }
 
-static int
-fill_rsumino(xfs_mount_t *mp)
+static void
+fill_rbmino(
+	struct xfs_mount	*mp)
 {
-	struct xfs_buf	*bp;
-	xfs_trans_t	*tp;
-	xfs_inode_t	*ip;
-	xfs_suminfo_t	*smp;
-	int		nmap;
-	int		error;
-	xfs_fileoff_t	bno;
-	xfs_fileoff_t	end_bno;
-	xfs_bmbt_irec_t	map;
+	struct xfs_trans	*tp;
+	struct xfs_inode	*ip;
+	int			error;
 
-	smp = sumcompute;
-	bno = 0;
-	end_bno = mp->m_rsumsize >> mp->m_sb.sb_blocklog;
+	error = -libxfs_trans_alloc_rollable(mp, 10, &tp);
+	if (error)
+		res_failed(error);
+
+	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rbmino, 0, &ip);
+	libxfs_trans_cancel(tp);
+	if (error)
+		do_error(
+_("couldn't iget realtime bitmap inode, error %d\n"), error);
+
+	error = -libxfs_rtfile_initialize_blocks(ip, 0, mp->m_sb.sb_rbmblocks,
+			btmcompute);
+	if (error)
+		do_error(
+_("couldn't re-initialize realtime bitmap inode, error %d\n"), error);
+
+	libxfs_irele(ip);
+}
+
+static void
+fill_rsumino(
+	struct xfs_mount	*mp)
+{
+	struct xfs_trans	*tp;
+	struct xfs_inode	*ip;
+	int			error;
 
 	error = -libxfs_trans_alloc_rollable(mp, 10, &tp);
 	if (error)
 		res_failed(error);
 
 	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rsumino, 0, &ip);
-	if (error) {
-		do_error(
-		_("couldn't iget realtime summary inode -- error - %d\n"),
-			error);
-	}
-
-	while (bno < end_bno)  {
-		/*
-		 * fill the file one block at a time
-		 */
-		nmap = 1;
-		error = -libxfs_bmapi_write(tp, ip, bno, 1, 0, 1, &map, &nmap);
-		if (error || nmap != 1) {
-			do_error(
-	_("couldn't map realtime summary inode block %" PRIu64 ", error = %d\n"),
-				bno, error);
-		}
-
-		ASSERT(map.br_startblock != HOLESTARTBLOCK);
-
-		error = -libxfs_trans_read_buf(
-				mp, tp, mp->m_dev,
-				XFS_FSB_TO_DADDR(mp, map.br_startblock),
-				XFS_FSB_TO_BB(mp, 1), 1, &bp, NULL);
-
-		if (error) {
-			do_warn(
-_("can't access block %" PRIu64 " (fsbno %" PRIu64 ") of realtime summary inode %" PRIu64 "\n"),
-				bno, map.br_startblock, mp->m_sb.sb_rsumino);
-			libxfs_irele(ip);
-			return(1);
-		}
-
-		memmove(bp->b_addr, smp, mp->m_sb.sb_blocksize);
-
-		libxfs_trans_log_buf(tp, bp, 0, mp->m_sb.sb_blocksize - 1);
-
-		smp = (xfs_suminfo_t *)((intptr_t)smp + mp->m_sb.sb_blocksize);
-		bno++;
-	}
-
-	libxfs_trans_ijoin(tp, ip, 0);
-	error = -libxfs_trans_commit(tp);
+	libxfs_trans_cancel(tp);
 	if (error)
-		do_error(_("%s: commit failed, error %d\n"), __func__, error);
+		do_error(
+_("couldn't iget realtime summary inode, error %d\n"), error);
+
+	mp->m_rsumip = ip;
+	error = -libxfs_rtfile_initialize_blocks(ip, 0, mp->m_rsumblocks,
+			sumcompute);
+	mp->m_rsumip = NULL;
+	if (error)
+		do_error(
+_("couldn't re-initialize realtime summary inode, error %d\n"), error);
+
 	libxfs_irele(ip);
-	return(0);
 }
 
 static void
 mk_rsumino(xfs_mount_t *mp)
 {
-	xfs_trans_t	*tp;
-	xfs_inode_t	*ip;
-	xfs_bmbt_irec_t	*ep;
-	int		i;
-	int		nmap;
-	int		error;
-	int		nsumblocks;
-	xfs_fileoff_t	bno;
-	xfs_bmbt_irec_t	map[XFS_BMAP_MAX_NMAP];
-	int		times;
-	uint		blocks;
+	struct xfs_trans	*tp;
+	struct xfs_inode	*ip;
+	int			error;
 
-	/*
-	 * first set up inode
-	 */
-	i = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 10, 0, 0, &tp);
-	if (i)
-		res_failed(i);
+	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 10, 0, 0, &tp);
+	if (error)
+		res_failed(error);
 
 	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rsumino, 0, &ip);
 	if (error) {
@@ -735,75 +577,13 @@ mk_rsumino(xfs_mount_t *mp)
 			error);
 	}
 
-	reset_inode_fields(ip);
-
-	VFS_I(ip)->i_mode = S_IFREG;
-	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
-	if (ip->i_afp)
-		ip->i_afp->if_format = XFS_DINODE_FMT_EXTENTS;
-
-	set_nlink(VFS_I(ip), 1);	/* account for sb ptr */
-
-	times = XFS_ICHGTIME_CHG | XFS_ICHGTIME_MOD;
-	if (xfs_has_v3inodes(mp)) {
-		VFS_I(ip)->i_version = 1;
-		ip->i_diflags2 = 0;
-		times |= XFS_ICHGTIME_CREATE;
-	}
-	libxfs_trans_ichgtime(tp, ip, times);
-
-	/*
-	 * now the ifork
-	 */
-	ip->i_df.if_bytes = 0;
-	ip->i_df.if_u1.if_root = NULL;
-
-	ip->i_disk_size = mp->m_rsumsize;
-
-	/*
-	 * commit changes
-	 */
-	libxfs_trans_ijoin(tp, ip, 0);
+	/* Reset the rt summary inode. */
+	reset_sbroot_ino(tp, S_IFREG, ip);
+	ip->i_disk_size = mp->m_rsumblocks * mp->m_sb.sb_blocksize;
 	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 	error = -libxfs_trans_commit(tp);
 	if (error)
 		do_error(_("%s: commit failed, error %d\n"), __func__, error);
-
-	/*
-	 * then allocate blocks for file and fill with zeroes (stolen
-	 * from mkfs)
-	 */
-	nsumblocks = mp->m_rsumsize >> mp->m_sb.sb_blocklog;
-	blocks = nsumblocks + XFS_BM_MAXLEVELS(mp, XFS_DATA_FORK) - 1;
-	error = -libxfs_trans_alloc_rollable(mp, blocks, &tp);
-	if (error)
-		res_failed(error);
-
-	libxfs_trans_ijoin(tp, ip, 0);
-	bno = 0;
-	while (bno < nsumblocks) {
-		nmap = XFS_BMAP_MAX_NMAP;
-		error = -libxfs_bmapi_write(tp, ip, bno,
-			  (xfs_extlen_t)(nsumblocks - bno),
-			  0, nsumblocks, map, &nmap);
-		if (error) {
-			do_error(
-		_("couldn't allocate realtime summary inode, error = %d\n"),
-				error);
-		}
-		for (i = 0, ep = map; i < nmap; i++, ep++) {
-			libxfs_device_zero(mp->m_ddev_targp,
-				      XFS_FSB_TO_DADDR(mp, ep->br_startblock),
-				      XFS_FSB_TO_BB(mp, ep->br_blockcount));
-			bno += ep->br_blockcount;
-		}
-	}
-	error = -libxfs_trans_commit(tp);
-	if (error) {
-		do_error(
-	_("allocation of the realtime summary ino failed, error = %d\n"),
-			error);
-	}
 	libxfs_irele(ip);
 }
 
@@ -819,7 +599,6 @@ mk_root_dir(xfs_mount_t *mp)
 	int		error;
 	const mode_t	mode = 0755;
 	ino_tree_node_t	*irec;
-	int		times;
 
 	ip = NULL;
 	i = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 10, 0, 0, &tp);
@@ -831,37 +610,8 @@ mk_root_dir(xfs_mount_t *mp)
 		do_error(_("could not iget root inode -- error - %d\n"), error);
 	}
 
-	/*
-	 * take care of the core -- initialization from xfs_ialloc()
-	 */
-	reset_inode_fields(ip);
-
-	VFS_I(ip)->i_mode = mode|S_IFDIR;
-	ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
-	if (ip->i_afp)
-		ip->i_afp->if_format = XFS_DINODE_FMT_EXTENTS;
-
-	set_nlink(VFS_I(ip), 2);	/* account for . and .. */
-
-	times = XFS_ICHGTIME_CHG | XFS_ICHGTIME_MOD;
-	if (xfs_has_v3inodes(mp)) {
-		VFS_I(ip)->i_version = 1;
-		ip->i_diflags2 = 0;
-		times |= XFS_ICHGTIME_CREATE;
-	}
-	libxfs_trans_ichgtime(tp, ip, times);
-	libxfs_trans_ijoin(tp, ip, 0);
-	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-
-	/*
-	 * now the ifork
-	 */
-	ip->i_df.if_bytes = 0;
-	ip->i_df.if_u1.if_root = NULL;
-
-	/*
-	 * initialize the directory
-	 */
+	/* Reset the root directory. */
+	reset_sbroot_ino(tp, mode | S_IFDIR, ip);
 	libxfs_dir_init(tp, ip, ip);
 
 	error = -libxfs_trans_commit(tp);
@@ -880,19 +630,33 @@ mk_root_dir(xfs_mount_t *mp)
  * orphanage name == lost+found
  */
 static xfs_ino_t
-mk_orphanage(xfs_mount_t *mp)
+mk_orphanage(
+	struct xfs_mount	*mp)
 {
-	xfs_ino_t	ino;
-	xfs_trans_t	*tp;
-	xfs_inode_t	*ip;
-	xfs_inode_t	*pip;
-	ino_tree_node_t	*irec;
-	int		ino_offset = 0;
-	int		i;
-	int		error;
-	const int	mode = 0755;
-	int		nres;
-	struct xfs_name	xname;
+	struct xfs_icreate_args	args = {
+		.idmap		= libxfs_nop_idmap,
+		.mode		= S_IFDIR | 0755,
+	};
+	struct xfs_name		xname = {
+		.name		= (unsigned char *)ORPHANAGE,
+		.len		= strlen(ORPHANAGE),
+		.type		= XFS_DIR3_FT_DIR,
+	};
+	struct xfs_dir_update	du = {
+		.name		= &xname,
+	};
+	struct xfs_trans	*tp;
+	struct ino_tree_node	*irec;
+	xfs_ino_t		ino;
+	int			ino_offset = 0;
+	int			i;
+	int			error;
+	int			nres;
+
+	i = -libxfs_parent_start(mp, &du.ppargs);
+	if (i)
+		do_error(_("%d - couldn't allocate parent pointer for %s\n"),
+			i, ORPHANAGE);
 
 	/*
 	 * check for an existing lost+found first, if it exists, return
@@ -900,43 +664,35 @@ mk_orphanage(xfs_mount_t *mp)
 	 * would have been cleared in phase3 and phase4.
 	 */
 
-	i = -libxfs_iget(mp, NULL, mp->m_sb.sb_rootino, 0, &pip);
+	i = -libxfs_iget(mp, NULL, mp->m_sb.sb_rootino, 0, &du.dp);
 	if (i)
 		do_error(_("%d - couldn't iget root inode to obtain %s\n"),
 			i, ORPHANAGE);
 
-	xname.name = (unsigned char *)ORPHANAGE;
-	xname.len = strlen(ORPHANAGE);
-	xname.type = XFS_DIR3_FT_DIR;
+	args.pip = du.dp;
 
-	if (libxfs_dir_lookup(NULL, pip, &xname, &ino, NULL) == 0)
-		return ino;
+	/* If the lookup of /lost+found succeeds, return the inumber. */
+	error = -libxfs_dir_lookup(NULL, du.dp, &xname, &ino, NULL);
+	if (error == 0)
+		goto out_pip;
 
 	/*
 	 * could not be found, create it
 	 */
-	nres = XFS_MKDIR_SPACE_RES(mp, xname.len);
+	nres = libxfs_mkdir_space_res(mp, xname.len);
 	i = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_mkdir, nres, 0, 0, &tp);
 	if (i)
 		res_failed(i);
 
-	/*
-	 * use iget/ijoin instead of trans_iget because the ialloc
-	 * wrapper can commit the transaction and start a new one
-	 */
-/*	i = -libxfs_iget(mp, NULL, mp->m_sb.sb_rootino, 0, &pip);
-	if (i)
-		do_error(_("%d - couldn't iget root inode to make %s\n"),
-			i, ORPHANAGE);*/
-
-	error = -libxfs_dir_ialloc(&tp, pip, mode|S_IFDIR,
-					1, 0, &zerocr, &zerofsx, &ip);
-	if (error) {
+	error = -libxfs_dialloc(&tp, &args, &ino);
+	if (error)
 		do_error(_("%s inode allocation failed %d\n"),
 			ORPHANAGE, error);
-	}
-	inc_nlink(VFS_I(ip));		/* account for . */
-	ino = ip->i_ino;
+
+	error = -libxfs_icreate(tp, ino, &args, &du.ip);
+	if (error)
+		do_error(_("%s inode initialization failed %d\n"),
+			ORPHANAGE, error);
 
 	irec = find_inode_rec(mp,
 			XFS_INO_TO_AGNO(mp, ino),
@@ -971,40 +727,80 @@ mk_orphanage(xfs_mount_t *mp)
 	 * now that we know the transaction will stay around,
 	 * add the root inode to it
 	 */
-	libxfs_trans_ijoin(tp, pip, 0);
+	libxfs_trans_ijoin(tp, du.dp, 0);
 
 	/*
 	 * create the actual entry
 	 */
-	error = -libxfs_dir_createname(tp, pip, &xname, ip->i_ino, nres);
+	error = -libxfs_dir_create_child(tp, nres, &du);
 	if (error)
 		do_error(
 		_("can't make %s, createname error %d\n"),
 			ORPHANAGE, error);
+	add_parent_ptr(du.ip->i_ino, (unsigned char *)ORPHANAGE, du.dp, false);
 
 	/*
-	 * bump up the link count in the root directory to account
-	 * for .. in the new directory, and update the irec copy of the
+	 * We bumped up the link count in the root directory to account
+	 * for .. in the new directory, so now update the irec copy of the
 	 * on-disk nlink so we don't fail the link count check later.
 	 */
-	inc_nlink(VFS_I(pip));
 	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, mp->m_sb.sb_rootino),
 				  XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rootino));
 	add_inode_ref(irec, 0);
 	set_inode_disk_nlinks(irec, 0, get_inode_disk_nlinks(irec, 0) + 1);
 
-	libxfs_trans_log_inode(tp, pip, XFS_ILOG_CORE);
-	libxfs_dir_init(tp, ip, pip);
-	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 	error = -libxfs_trans_commit(tp);
 	if (error) {
 		do_error(_("%s directory creation failed -- bmapf error %d\n"),
 			ORPHANAGE, error);
 	}
-	libxfs_irele(ip);
-	libxfs_irele(pip);
+	libxfs_irele(du.ip);
+out_pip:
+	libxfs_irele(du.dp);
+	libxfs_parent_finish(mp, du.ppargs);
 
 	return(ino);
+}
+
+/*
+ * Add a parent pointer back to the orphanage for any file we're moving into
+ * the orphanage, being careful not to trip over any existing parent pointer.
+ * You never know when the orphanage might get corrupted.
+ */
+static void
+add_orphan_pptr(
+	struct xfs_trans	*tp,
+	struct xfs_inode	*orphanage_ip,
+	const struct xfs_name	*xname,
+	struct xfs_inode	*ip,
+	struct xfs_parent_args	*ppargs)
+{
+	struct xfs_parent_rec	pptr = { };
+	struct xfs_da_args	scratch;
+	int			error;
+
+	xfs_inode_to_parent_rec(&pptr, orphanage_ip);
+	error = -libxfs_parent_lookup(tp, ip, xname, &pptr, &scratch);
+	if (!error)
+		return;
+	if (error != ENOATTR)
+		do_log(
+ _("cannot look up parent pointer for '%.*s', err %d\n"),
+				xname->len, xname->name, error);
+
+	if (!xfs_inode_has_attr_fork(ip)) {
+		error = -libxfs_bmap_add_attrfork(tp, ip,
+				sizeof(struct xfs_attr_sf_hdr), true);
+		if (error)
+			do_error(_("can't add attr fork to inode 0x%llx\n"),
+					(unsigned long long)ip->i_ino);
+	}
+
+	error = -libxfs_parent_addname(tp, ppargs, orphanage_ip, xname, ip);
+	if (error)
+		do_error(
+ _("can't add parent pointer for '%.*s', error %d\n"),
+				xname->len, xname->name, error);
 }
 
 /*
@@ -1027,6 +823,13 @@ mv_orphanage(
 	ino_tree_node_t		*irec;
 	int			ino_offset = 0;
 	struct xfs_name		xname;
+	struct xfs_parent_args	*ppargs;
+
+	err = -libxfs_parent_start(mp, &ppargs);
+	if (err)
+		do_error(
+ _("%d - couldn't allocate parent pointer for lost inode\n"),
+			err);
 
 	xname.name = fname;
 	xname.len = snprintf((char *)fname, sizeof(fname), "%llu",
@@ -1078,10 +881,14 @@ mv_orphanage(
 				do_error(
 	_("name create failed in %s (%d)\n"), ORPHANAGE, err);
 
+			if (ppargs)
+				add_orphan_pptr(tp, orphanage_ip, &xname,
+						ino_p, ppargs);
+
 			if (irec)
 				add_inode_ref(irec, ino_offset);
 			else
-				inc_nlink(VFS_I(orphanage_ip));
+				libxfs_bumplink(tp, orphanage_ip);
 			libxfs_trans_log_inode(tp, orphanage_ip, XFS_ILOG_CORE);
 
 			err = -libxfs_dir_createname(tp, ino_p, &xfs_name_dotdot,
@@ -1090,7 +897,7 @@ mv_orphanage(
 				do_error(
 	_("creation of .. entry failed (%d)\n"), err);
 
-			inc_nlink(VFS_I(ino_p));
+			libxfs_bumplink(tp, ino_p);
 			libxfs_trans_log_inode(tp, ino_p, XFS_ILOG_CORE);
 			err = -libxfs_trans_commit(tp);
 			if (err)
@@ -1112,10 +919,14 @@ mv_orphanage(
 				do_error(
 	_("name create failed in %s (%d)\n"), ORPHANAGE, err);
 
+			if (ppargs)
+				add_orphan_pptr(tp, orphanage_ip, &xname,
+						ino_p, ppargs);
+
 			if (irec)
 				add_inode_ref(irec, ino_offset);
 			else
-				inc_nlink(VFS_I(orphanage_ip));
+				libxfs_bumplink(tp, orphanage_ip);
 			libxfs_trans_log_inode(tp, orphanage_ip, XFS_ILOG_CORE);
 
 			/*
@@ -1160,6 +971,10 @@ mv_orphanage(
 	_("name create failed in %s (%d)\n"), ORPHANAGE, err);
 		ASSERT(err == 0);
 
+		if (ppargs)
+			add_orphan_pptr(tp, orphanage_ip, &xname, ino_p,
+					ppargs);
+
 		set_nlink(VFS_I(ino_p), 1);
 		libxfs_trans_log_inode(tp, ino_p, XFS_ILOG_CORE);
 		err = -libxfs_trans_commit(tp);
@@ -1167,8 +982,13 @@ mv_orphanage(
 			do_error(
 	_("orphanage name create failed (%d)\n"), err);
 	}
+
+	if (xfs_has_parent(mp))
+		add_parent_ptr(ino_p->i_ino, xname.name, orphanage_ip, false);
+
 	libxfs_irele(ino_p);
 	libxfs_irele(orphanage_ip);
+	libxfs_parent_finish(mp, ppargs);
 }
 
 static int
@@ -1176,16 +996,17 @@ entry_junked(
 	const char 	*msg,
 	const char	*iname,
 	xfs_ino_t	ino1,
-	xfs_ino_t	ino2)
+	xfs_ino_t	ino2,
+	xfs_ino_t	ino3)
 {
-	do_warn(msg, iname, ino1, ino2);
-	if (!no_modify) {
-		if (verbose)
-			do_warn(_(", marking entry to be junked\n"));
-		else
-			do_warn("\n");
-	} else
-		do_warn(_(", would junk entry\n"));
+	if(ino3 != NULLFSINO)
+		do_warn(msg, iname, ino1, ino2, ino3);
+	else
+		do_warn(msg, iname, ino1, ino2);
+	if (!no_modify)
+		do_warn(_("junking entry\n"));
+	else
+		do_warn(_("would junk entry\n"));
 	return !no_modify;
 }
 
@@ -1209,7 +1030,7 @@ dir_binval(
 		return 0;
 
 	geo = tp->t_mountp->m_dir_geo;
-	ifp = XFS_IFORK_PTR(ip, XFS_DATA_FORK);
+	ifp = xfs_ifork_ptr(ip, XFS_DATA_FORK);
 	for_each_xfs_iext(ifp, &icur, &rec) {
 		for (dabno = roundup(rec.br_startoff, geo->fsbcount);
 		     dabno < rec.br_startoff + rec.br_blockcount;
@@ -1269,7 +1090,7 @@ longform_dir2_rebuild(
 	    libxfs_dir_ino_validate(mp, pip.i_ino))
 		pip.i_ino = mp->m_sb.sb_rootino;
 
-	nres = XFS_REMOVE_SPACE_RES(mp);
+	nres = libxfs_remove_space_res(mp, 0);
 	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_remove, nres, 0, 0, &tp);
 	if (error)
 		res_failed(error);
@@ -1322,13 +1143,14 @@ longform_dir2_rebuild(
 	/* go through the hash list and re-add the inodes */
 
 	for (p = hashtab->first; p; p = p->nextbyorder) {
-
+		if (p->junkit)
+			continue;
 		if (p->name.name[0] == '/' || (p->name.name[0] == '.' &&
 				(p->name.len == 1 || (p->name.len == 2 &&
 						p->name.name[1] == '.'))))
 			continue;
 
-		nres = XFS_CREATE_SPACE_RES(mp, p->name.len);
+		nres = libxfs_create_space_res(mp, p->name.len);
 		error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_create,
 					    nres, 0, 0, &tp);
 		if (error)
@@ -1374,7 +1196,7 @@ dir2_kill_block(
 	int		nres;
 	xfs_trans_t	*tp;
 
-	nres = XFS_REMOVE_SPACE_RES(mp);
+	nres = libxfs_remove_space_res(mp, 0);
 	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_remove, nres, 0, 0, &tp);
 	if (error)
 		res_failed(error);
@@ -1386,6 +1208,7 @@ dir2_kill_block(
 	args.trans = tp;
 	args.whichfork = XFS_DATA_FORK;
 	args.geo = mp->m_dir_geo;
+	args.owner = ip->i_ino;
 	if (da_bno >= mp->m_dir_geo->leafblk && da_bno < mp->m_dir_geo->freeblk)
 		error = -libxfs_da_shrink_inode(&args, da_bno, bp);
 	else
@@ -1398,6 +1221,48 @@ dir2_kill_block(
 	if (error)
 		do_error(
 _("directory shrink failed (%d)\n"), error);
+}
+
+static inline void
+check_longform_ftype(
+	struct xfs_mount	*mp,
+	struct xfs_inode	*ip,
+	xfs_dir2_data_entry_t	*dep,
+	ino_tree_node_t		*irec,
+	int			ino_offset,
+	struct dir_hash_tab	*hashtab,
+	xfs_dir2_dataptr_t	addr,
+	struct xfs_da_args	*da,
+	struct xfs_buf		*bp)
+{
+	xfs_ino_t		inum = be64_to_cpu(dep->inumber);
+	uint8_t			dir_ftype;
+	uint8_t			ino_ftype;
+
+	if (!xfs_has_ftype(mp))
+		return;
+
+	dir_ftype = libxfs_dir2_data_get_ftype(mp, dep);
+	ino_ftype = get_inode_ftype(irec, ino_offset);
+
+	if (dir_ftype == ino_ftype)
+		return;
+
+	if (no_modify) {
+		do_warn(
+_("would fix ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
+			dir_ftype, ino_ftype,
+			ip->i_ino, inum);
+		return;
+	}
+
+	do_warn(
+_("fixing ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
+		dir_ftype, ino_ftype,
+		ip->i_ino, inum);
+	libxfs_dir2_data_put_ftype(mp, dep, ino_ftype);
+	libxfs_dir2_data_log_entry(da, bp, dep);
+	dir_hash_update_ftype(hashtab, addr, ino_ftype);
 }
 
 /*
@@ -1416,7 +1281,7 @@ longform_dir2_entry_check_data(
 	struct dir_hash_tab	*hashtab,
 	freetab_t		**freetabp,
 	xfs_dablk_t		da_bno,
-	int			isblock)
+	bool			isblock)
 {
 	xfs_dir2_dataptr_t	addr;
 	xfs_dir2_leaf_entry_t	*blp;
@@ -1433,6 +1298,7 @@ longform_dir2_entry_check_data(
 	int			i;
 	int			ino_offset;
 	xfs_ino_t		inum;
+	xfs_ino_t		dup_inum;
 	ino_tree_node_t		*irec;
 	int			junkit;
 	int			lastfree;
@@ -1447,6 +1313,7 @@ longform_dir2_entry_check_data(
 	struct xfs_da_args	da = {
 		.dp = ip,
 		.geo = mp->m_dir_geo,
+		.owner = ip->i_ino,
 	};
 
 
@@ -1642,8 +1509,8 @@ longform_dir2_entry_check_data(
 		if (irec == NULL)  {
 			nbad++;
 			if (entry_junked(
-	_("entry \"%s\" in directory inode %" PRIu64 " points to non-existent inode %" PRIu64 ""),
-					fname, ip->i_ino, inum)) {
+	_("entry \"%s\" in directory inode %" PRIu64 " points to non-existent inode %" PRIu64 ", "),
+					fname, ip->i_ino, inum, NULLFSINO)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
 			}
@@ -1659,8 +1526,8 @@ longform_dir2_entry_check_data(
 		if (is_inode_free(irec, ino_offset))  {
 			nbad++;
 			if (entry_junked(
-	_("entry \"%s\" in directory inode %" PRIu64 " points to free inode %" PRIu64),
-					fname, ip->i_ino, inum)) {
+	_("entry \"%s\" in directory inode %" PRIu64 " points to free inode %" PRIu64 ", "),
+					fname, ip->i_ino, inum, NULLFSINO)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
 			}
@@ -1677,8 +1544,8 @@ longform_dir2_entry_check_data(
 			if (!inode_isadir(irec, ino_offset)) {
 				nbad++;
 				if (entry_junked(
-	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory"),
-						ORPHANAGE, inum, ip->i_ino)) {
+	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory, "),
+						ORPHANAGE, inum, ip->i_ino, NULLFSINO)) {
 					dep->name[0] = '/';
 					libxfs_dir2_data_log_entry(&da, bp, dep);
 				}
@@ -1695,12 +1562,13 @@ longform_dir2_entry_check_data(
 		/*
 		 * check for duplicate names in directory.
 		 */
-		if (!dir_hash_add(mp, hashtab, addr, inum, dep->namelen,
-				dep->name, libxfs_dir2_data_get_ftype(mp, dep))) {
+		dup_inum = dir_hash_add(mp, hashtab, addr, inum, dep->namelen,
+				dep->name, libxfs_dir2_data_get_ftype(mp, dep));
+		if (dup_inum != NULLFSINO) {
 			nbad++;
 			if (entry_junked(
-	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
-					fname, inum, ip->i_ino)) {
+	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " already points to ino %" PRIu64 ", "),
+					fname, inum, ip->i_ino, dup_inum)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
 			}
@@ -1730,13 +1598,18 @@ longform_dir2_entry_check_data(
 				/* ".." should be in the first block */
 				nbad++;
 				if (entry_junked(
-	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is not in the the first block"), fname,
-						inum, ip->i_ino)) {
+	_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is not in the the first block, "), fname,
+						inum, ip->i_ino, NULLFSINO)) {
 					dir_hash_junkit(hashtab, addr);
 					dep->name[0] = '/';
 					libxfs_dir2_data_log_entry(&da, bp, dep);
 				}
 			}
+
+			if (!nbad)
+				check_longform_ftype(mp, ip, dep, irec,
+						ino_offset, hashtab, addr, &da,
+						bp);
 			continue;
 		}
 		ASSERT(no_modify || libxfs_verify_dir_ino(mp, inum));
@@ -1758,13 +1631,18 @@ longform_dir2_entry_check_data(
 				/* "." should be the first entry */
 				nbad++;
 				if (entry_junked(
-	_("entry \"%s\" in dir %" PRIu64 " is not the first entry"),
-						fname, inum, ip->i_ino)) {
+	_("entry \"%s\" in dir %" PRIu64 " is not the first entry, "),
+						fname, inum, ip->i_ino, NULLFSINO)) {
 					dir_hash_junkit(hashtab, addr);
 					dep->name[0] = '/';
 					libxfs_dir2_data_log_entry(&da, bp, dep);
 				}
 			}
+
+			if (!nbad)
+				check_longform_ftype(mp, ip, dep, irec,
+						ino_offset, hashtab, addr, &da,
+						bp);
 			*need_dot = 0;
 			continue;
 		}
@@ -1775,31 +1653,8 @@ longform_dir2_entry_check_data(
 			continue;
 
 		/* validate ftype field if supported */
-		if (xfs_has_ftype(mp)) {
-			uint8_t dir_ftype;
-			uint8_t ino_ftype;
-
-			dir_ftype = libxfs_dir2_data_get_ftype(mp, dep);
-			ino_ftype = get_inode_ftype(irec, ino_offset);
-
-			if (dir_ftype != ino_ftype) {
-				if (no_modify) {
-					do_warn(
-	_("would fix ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
-						dir_ftype, ino_ftype,
-						ip->i_ino, inum);
-				} else {
-					do_warn(
-	_("fixing ftype mismatch (%d/%d) in directory/child inode %" PRIu64 "/%" PRIu64 "\n"),
-						dir_ftype, ino_ftype,
-						ip->i_ino, inum);
-					libxfs_dir2_data_put_ftype(mp, dep, ino_ftype);
-					libxfs_dir2_data_log_entry(&da, bp, dep);
-					dir_hash_update_ftype(hashtab, addr,
-							      ino_ftype);
-				}
-			}
-		}
+		check_longform_ftype(mp, ip, dep, irec, ino_offset, hashtab,
+				addr, &da, bp);
 
 		/*
 		 * check easy case first, regular inode, just bump
@@ -1810,7 +1665,14 @@ longform_dir2_entry_check_data(
 			continue;
 		}
 		parent = get_inode_parent(irec, ino_offset);
-		ASSERT(parent != 0);
+		if (parent == 0) {
+			if (no_modify)
+				do_warn(
+ _("unknown parent for inode %" PRIu64 "\n"),
+						inum);
+			else
+				ASSERT(parent != 0);
+		}
 		junkit = 0;
 		/*
 		 * bump up the link counts in parent and child
@@ -1852,8 +1714,7 @@ _("entry \"%s\" in dir inode %" PRIu64 " inconsistent with .. value (%" PRIu64 "
 				dir_hash_junkit(hashtab, addr);
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
-				if (verbose)
-					do_warn(
+				do_warn(
 					_("\twill clear entry \"%s\"\n"),
 						fname);
 			} else  {
@@ -2217,12 +2078,12 @@ longform_dir2_entry_check(
 	xfs_dablk_t		da_bno;
 	freetab_t		*freetab;
 	int			i;
-	int			isblock;
-	int			isleaf;
+	enum xfs_dir2_fmt	fmt;
 	xfs_fileoff_t		next_da_bno;
 	int			seeval;
 	int			fixit = 0;
 	struct xfs_da_args	args;
+	int			error;
 
 	*need_dot = 1;
 	freetab = malloc(FREETAB_SIZE(ip->i_disk_size / mp->m_dir_geo->blksize));
@@ -2242,8 +2103,8 @@ longform_dir2_entry_check(
 	/* is this a block, leaf, or node directory? */
 	args.dp = ip;
 	args.geo = mp->m_dir_geo;
-	libxfs_dir2_isblock(&args, &isblock);
-	libxfs_dir2_isleaf(&args, &isleaf);
+	args.owner = ip->i_ino;
+	fmt = libxfs_dir2_format(&args, &error);
 
 	/* check directory "data" blocks (ie. name/inode pairs) */
 	for (da_bno = 0, next_da_bno = 0;
@@ -2266,7 +2127,7 @@ longform_dir2_entry_check(
 			break;
 		}
 
-		if (isblock)
+		if (fmt == XFS_DIR2_FMT_BLOCK)
 			ops = &xfs_dir3_block_buf_ops;
 		else
 			ops = &xfs_dir3_data_buf_ops;
@@ -2283,7 +2144,7 @@ longform_dir2_entry_check(
 			 * block form and we fail, there isn't anything else to
 			 * read, and nothing we can do but trash it.
 			 */
-			if (isblock) {
+			if (fmt == XFS_DIR2_FMT_BLOCK) {
 				fixit++;
 				goto out_fix;
 			}
@@ -2297,25 +2158,29 @@ longform_dir2_entry_check(
 			error = check_dir3_header(mp, bp, ino);
 			if (error) {
 				fixit++;
-				if (isblock)
+				if (fmt == XFS_DIR2_FMT_BLOCK)
 					goto out_fix;
+
+				libxfs_buf_relse(bp);
+				bp = NULL;
 				continue;
 			}
 		}
 
 		longform_dir2_entry_check_data(mp, ip, num_illegal, need_dot,
 				irec, ino_offset, bp, hashtab,
-				&freetab, da_bno, isblock);
-		if (isblock)
+				&freetab, da_bno, fmt == XFS_DIR2_FMT_BLOCK);
+		if (fmt == XFS_DIR2_FMT_BLOCK)
 			break;
 
 		libxfs_buf_relse(bp);
+		bp = NULL;
 	}
 	fixit |= (*num_illegal != 0) || dir2_is_badino(ino) || *need_dot;
 
 	if (!dotdot_update) {
 		/* check btree and freespace */
-		if (isblock) {
+		if (fmt == XFS_DIR2_FMT_BLOCK) {
 			struct xfs_dir2_data_hdr *block;
 			xfs_dir2_block_tail_t	*btp;
 			xfs_dir2_leaf_entry_t	*blp;
@@ -2328,7 +2193,7 @@ longform_dir2_entry_check(
 						be32_to_cpu(btp->stale));
 			if (dir_hash_check(hashtab, ip, seeval))
 				fixit |= 1;
-		} else if (isleaf) {
+		} else if (fmt == XFS_DIR2_FMT_LEAF) {
 			fixit |= longform_dir2_check_leaf(mp, ip, hashtab,
 								freetab);
 		} else {
@@ -2337,7 +2202,7 @@ longform_dir2_entry_check(
 		}
 	}
 out_fix:
-	if (isblock && bp)
+	if (bp)
 		libxfs_buf_relse(bp);
 
 	if (!no_modify && (fixit || dotdot_update)) {
@@ -2406,10 +2271,7 @@ shortform_dir2_junk(
 	 */
 	(*index)--;
 
-	if (verbose)
-		do_warn(_("junking entry\n"));
-	else
-		do_warn("\n");
+	do_warn(_("junking entry\n"));
 	return sfep;
 }
 
@@ -2425,11 +2287,13 @@ shortform_dir2_entry_check(
 {
 	xfs_ino_t		lino;
 	xfs_ino_t		parent;
-	struct xfs_dir2_sf_hdr	*sfp;
+	xfs_ino_t		dup_inum;
+	struct xfs_dir2_sf_hdr	*sfp = ip->i_df.if_data;
 	struct xfs_dir2_sf_entry *sfep;
 	struct xfs_dir2_sf_entry *next_sfep;
 	struct xfs_ifork	*ifp;
 	struct ino_tree_node	*irec;
+	xfs_dir2_dataptr_t	diroffset;
 	int			max_size;
 	int			ino_offset;
 	int			i;
@@ -2440,7 +2304,6 @@ shortform_dir2_entry_check(
 	int			i8;
 
 	ifp = &ip->i_df;
-	sfp = (struct xfs_dir2_sf_hdr *) ifp->if_u1.if_data;
 	*ino_dirty = 0;
 	bytes_deleted = 0;
 
@@ -2558,7 +2421,7 @@ shortform_dir2_entry_check(
 
 		if (irec == NULL)  {
 			do_warn(
-	_("entry \"%s\" in shortform directory %" PRIu64 " references non-existent inode %" PRIu64 "\n"),
+	_("entry \"%s\" in shortform directory %" PRIu64 " references non-existent inode %" PRIu64 ", "),
 				fname, ino, lino);
 			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
 						&max_size, &i, &bytes_deleted,
@@ -2575,7 +2438,7 @@ shortform_dir2_entry_check(
 		 */
 		if (is_inode_free(irec, ino_offset))  {
 			do_warn(
-	_("entry \"%s\" in shortform directory inode %" PRIu64 " points to free inode %" PRIu64 "\n"),
+	_("entry \"%s\" in shortform directory inode %" PRIu64 " points to free inode %" PRIu64 ", "),
 				fname, ino, lino);
 			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
 						&max_size, &i, &bytes_deleted,
@@ -2591,7 +2454,7 @@ shortform_dir2_entry_check(
 			 */
 			if (!inode_isadir(irec, ino_offset)) {
 				do_warn(
-	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory"),
+	_("%s (ino %" PRIu64 ") in root (%" PRIu64 ") is not a directory, "),
 					ORPHANAGE, lino, ino);
 				next_sfep = shortform_dir2_junk(mp, sfp, sfep,
 						lino, &max_size, &i,
@@ -2608,13 +2471,15 @@ shortform_dir2_entry_check(
 		/*
 		 * check for duplicate names in directory.
 		 */
-		if (!dir_hash_add(mp, hashtab, (xfs_dir2_dataptr_t)
-				(sfep - xfs_dir2_sf_firstentry(sfp)),
+		diroffset = xfs_dir2_byte_to_dataptr(
+				xfs_dir2_sf_get_offset(sfep));
+		dup_inum = dir_hash_add(mp, hashtab, diroffset,
 				lino, sfep->namelen, sfep->name,
-				libxfs_dir2_sf_get_ftype(mp, sfep))) {
+				libxfs_dir2_sf_get_ftype(mp, sfep));
+		if (dup_inum != NULLFSINO) {
 			do_warn(
-_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
-				fname, lino, ino);
+_("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " already points to ino %" PRIu64 ", "),
+				fname, lino, ino, dup_inum);
 			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
 						&max_size, &i, &bytes_deleted,
 						ino_dirty);
@@ -2638,11 +2503,12 @@ _("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
 			if (is_inode_reached(irec, ino_offset))  {
 				do_warn(
 	_("entry \"%s\" in directory inode %" PRIu64
-	  " references already connected inode %" PRIu64 ".\n"),
+	  " references already connected inode %" PRIu64 ", "),
 					fname, ino, lino);
 				next_sfep = shortform_dir2_junk(mp, sfp, sfep,
 						lino, &max_size, &i,
 						&bytes_deleted, ino_dirty);
+				dir_hash_junkit(hashtab, diroffset);
 				continue;
 			} else if (parent == ino)  {
 				add_inode_reached(irec, ino_offset);
@@ -2662,11 +2528,12 @@ _("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
 				do_warn(
 	_("entry \"%s\" in directory inode %" PRIu64
 	  " not consistent with .. value (%" PRIu64
-	  ") in inode %" PRIu64 ",\n"),
+	  ") in inode %" PRIu64 ", "),
 					fname, ino, parent, lino);
 				next_sfep = shortform_dir2_junk(mp, sfp, sfep,
 						lino, &max_size, &i,
 						&bytes_deleted, ino_dirty);
+				dir_hash_junkit(hashtab, diroffset);
 				continue;
 			}
 		}
@@ -2755,6 +2622,30 @@ _("entry \"%s\" (ino %" PRIu64 ") in dir %" PRIu64 " is a duplicate name"),
 	_("setting size to %" PRId64 " bytes to reflect junked entries\n"),
 			ip->i_disk_size);
 		*ino_dirty = 1;
+	}
+}
+
+static void
+dir_hash_add_parent_ptrs(
+	struct xfs_inode	*dp,
+	struct dir_hash_tab	*hashtab)
+{
+	struct dir_hash_ent	*p;
+
+	if (!xfs_has_parent(dp->i_mount))
+		return;
+
+	for (p = hashtab->first; p; p = p->nextbyorder) {
+		if (p->junkit)
+			continue;
+		if (p->name.name[0] == '/')
+			continue;
+		if (p->name.name[0] == '.' &&
+		    (p->name.len == 1 ||
+		     (p->name.len == 2 && p->name.name[1] == '.')))
+			continue;
+
+		add_parent_ptr(p->inum, p->name.name, dp, dotdot_update);
 	}
 }
 
@@ -2854,7 +2745,7 @@ process_dir_inode(
 			 * inode but it's easier than wedging a
 			 * new define in ourselves.
 			 */
-			nres = no_modify ? 0 : XFS_REMOVE_SPACE_RES(mp);
+			nres = no_modify ? 0 : libxfs_remove_space_res(mp, 0);
 			error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_remove,
 						    nres, 0, 0, &tp);
 			if (error)
@@ -2884,6 +2775,7 @@ _("error %d fixing shortform directory %llu\n"),
 		default:
 			break;
 	}
+	dir_hash_add_parent_ptrs(ip, hashtab);
 	dir_hash_done(hashtab);
 
 	/*
@@ -2901,7 +2793,7 @@ _("error %d fixing shortform directory %llu\n"),
 
 		do_warn(_("recreating root directory .. entry\n"));
 
-		nres = XFS_MKDIR_SPACE_RES(mp, 2);
+		nres = libxfs_mkdir_space_res(mp, 2);
 		error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_mkdir,
 					    nres, 0, 0, &tp);
 		if (error)
@@ -2956,7 +2848,7 @@ _("error %d fixing shortform directory %llu\n"),
 			do_warn(
 	_("creating missing \".\" entry in dir ino %" PRIu64 "\n"), ino);
 
-			nres = XFS_MKDIR_SPACE_RES(mp, 1);
+			nres = libxfs_mkdir_space_res(mp, 1);
 			error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_mkdir,
 						    nres, 0, 0, &tp);
 			if (error)
@@ -3175,8 +3067,8 @@ phase6(xfs_mount_t *mp)
 	ino_tree_node_t		*irec;
 	int			i;
 
-	memset(&zerocr, 0, sizeof(struct cred));
-	memset(&zerofsx, 0, sizeof(struct fsxattr));
+	parent_ptr_init(mp);
+
 	orphanage_ino = 0;
 
 	do_log(_("Phase 6 - check inode connectivity...\n"));
@@ -3225,15 +3117,8 @@ phase6(xfs_mount_t *mp)
 	if (!no_modify)  {
 		do_log(
 _("        - resetting contents of realtime bitmap and summary inodes\n"));
-		if (fill_rbmino(mp))  {
-			do_warn(
-			_("Warning:  realtime bitmap may be inconsistent\n"));
-		}
-
-		if (fill_rsumino(mp))  {
-			do_warn(
-			_("Warning:  realtime bitmap may be inconsistent\n"));
-		}
+		fill_rbmino(mp);
+		fill_rsumino(mp);
 	}
 
 	mark_standalone_inodes(mp);
@@ -3275,4 +3160,8 @@ _("        - resetting contents of realtime bitmap and summary inodes\n"));
 			irec = next_ino_rec(irec);
 		}
 	}
+
+	/* Check and repair directory parent pointers, if enabled. */
+	check_parent_ptrs(mp);
+	parent_ptr_free(mp);
 }

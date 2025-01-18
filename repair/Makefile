@@ -16,6 +16,7 @@ HFILES = \
 	avl.h \
 	bulkload.h \
 	bmap.h \
+	bmap_repair.h \
 	btree.h \
 	da_util.h \
 	dinode.h \
@@ -23,14 +24,18 @@ HFILES = \
 	err_protos.h \
 	globals.h \
 	incore.h \
+	pptr.h \
 	prefetch.h \
 	progress.h \
 	protos.h \
 	quotacheck.h \
+	rcbag_btree.h \
+	rcbag.h \
 	rmap.h \
 	rt.h \
 	scan.h \
 	slab.h \
+	strblobs.h \
 	threads.h \
 	versions.h
 
@@ -41,6 +46,7 @@ CFILES = \
 	avl.c \
 	bulkload.c \
 	bmap.c \
+	bmap_repair.c \
 	btree.c \
 	da_util.c \
 	dino_chunks.c \
@@ -59,14 +65,18 @@ CFILES = \
 	phase5.c \
 	phase6.c \
 	phase7.c \
+	pptr.c \
 	prefetch.c \
 	progress.c \
 	quotacheck.c \
+	rcbag_btree.c \
+	rcbag.c \
 	rmap.c \
 	rt.c \
 	sb.c \
 	scan.c \
 	slab.c \
+	strblobs.c \
 	threads.c \
 	versions.c \
 	xfs_repair.c
@@ -97,8 +107,8 @@ include $(BUILDRULES)
 #CFLAGS += ...
 
 install: default
-	$(INSTALL) -m 755 -d $(PKG_ROOT_SBIN_DIR)
-	$(LTINSTALL) -m 755 $(LTCOMMAND) $(PKG_ROOT_SBIN_DIR)
+	$(INSTALL) -m 755 -d $(PKG_SBIN_DIR)
+	$(LTINSTALL) -m 755 $(LTCOMMAND) $(PKG_SBIN_DIR)
 install-dev:
 
 -include .dep

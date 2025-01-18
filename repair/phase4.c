@@ -142,17 +142,7 @@ static void
 process_ags(
 	xfs_mount_t		*mp)
 {
-	xfs_agnumber_t		i;
-	int			error;
-
 	do_inode_prefetch(mp, ag_stride, process_ag_func, true, false);
-	for (i = 0; i < mp->m_sb.sb_agcount; i++) {
-		error = rmap_finish_collecting_fork_recs(mp, i);
-		if (error)
-			do_error(
-_("unable to finish adding attr/data fork reverse-mapping data for AG %u.\n"),
-				i);
-	}
 }
 
 static void
@@ -161,23 +151,8 @@ check_rmap_btrees(
 	xfs_agnumber_t	agno,
 	void		*arg)
 {
-	int		error;
-
-	error = rmap_add_fixed_ag_rec(wq->wq_ctx, agno);
-	if (error)
-		do_error(
-_("unable to add AG %u metadata reverse-mapping data.\n"), agno);
-
-	error = rmap_fold_raw_recs(wq->wq_ctx, agno);
-	if (error)
-		do_error(
-_("unable to merge AG %u metadata reverse-mapping data.\n"), agno);
-
-	error = rmaps_verify_btree(wq->wq_ctx, agno);
-	if (error)
-		do_error(
-_("%s while checking reverse-mappings"),
-			 strerror(-error));
+	rmap_add_fixed_ag_rec(wq->wq_ctx, agno);
+	rmaps_verify_btree(wq->wq_ctx, agno);
 }
 
 static void
@@ -192,7 +167,7 @@ compute_ag_refcounts(
 	if (error)
 		do_error(
 _("%s while computing reference count records.\n"),
-			 strerror(-error));
+			 strerror(error));
 }
 
 static void
@@ -212,17 +187,11 @@ _("%s while fixing inode reflink flags.\n"),
 
 static void
 check_refcount_btrees(
-	struct workqueue*wq,
-	xfs_agnumber_t	agno,
-	void		*arg)
+	struct workqueue	*wq,
+	xfs_agnumber_t		agno,
+	void			*arg)
 {
-	int		error;
-
-	error = check_refcounts(wq->wq_ctx, agno);
-	if (error)
-		do_error(
-_("%s while checking reference counts"),
-			 strerror(-error));
+	check_refcounts(wq->wq_ctx, agno);
 }
 
 static void
@@ -260,9 +229,9 @@ void
 phase4(xfs_mount_t *mp)
 {
 	ino_tree_node_t		*irec;
-	xfs_rtblock_t		bno;
-	xfs_rtblock_t		rt_start;
-	xfs_extlen_t		rt_len;
+	xfs_rtxnum_t		rtx;
+	xfs_rtxnum_t		rt_start;
+	xfs_rtxlen_t		rt_len;
 	xfs_agnumber_t		i;
 	xfs_agblock_t		j;
 	xfs_agblock_t		ag_end;
@@ -341,14 +310,14 @@ phase4(xfs_mount_t *mp)
 	rt_start = 0;
 	rt_len = 0;
 
-	for (bno = 0; bno < mp->m_sb.sb_rextents; bno++)  {
-		bstate = get_rtbmap(bno);
+	for (rtx = 0; rtx < mp->m_sb.sb_rextents; rtx++)  {
+		bstate = get_rtbmap(rtx);
 		switch (bstate)  {
 		case XR_E_BAD_STATE:
 		default:
 			do_warn(
 	_("unknown rt extent state, extent %" PRIu64 "\n"),
-				bno);
+				rtx);
 			fallthrough;
 		case XR_E_UNKNOWN:
 		case XR_E_FREE1:
@@ -370,14 +339,14 @@ phase4(xfs_mount_t *mp)
 			break;
 		case XR_E_MULT:
 			if (rt_start == 0)  {
-				rt_start = bno;
+				rt_start = rtx;
 				rt_len = 1;
-			} else if (rt_len == MAXEXTLEN)  {
+			} else if (rt_len == XFS_MAX_BMBT_EXTLEN)  {
 				/*
 				 * large extent case
 				 */
 				add_rt_dup_extent(rt_start, rt_len);
-				rt_start = bno;
+				rt_start = rtx;
 				rt_len = 1;
 			} else
 				rt_len++;
@@ -432,4 +401,11 @@ phase4(xfs_mount_t *mp)
 	 */
 	quotino_check(mp);
 	quota_sb_check(mp);
+
+	/* Check the rt metadata before we rebuild */
+	if (mp->m_sb.sb_rblocks)  {
+		do_log(
+		_("        - generate realtime summary info and bitmap...\n"));
+		check_rtmetadata(mp);
+	}
 }

@@ -210,28 +210,27 @@ process_shortform_attr(
 	struct xfs_dinode		*dip,
 	int				*repair)
 {
-	struct xfs_attr_shortform	*asf;
+	struct xfs_attr_sf_hdr		*hdr = XFS_DFORK_APTR(dip);
 	struct xfs_attr_sf_entry	*currententry, *nextentry, *tempentry;
+	xfs_failaddr_t			fa;
 	int				i, junkit;
 	int				currentsize, remainingspace;
 
 	*repair = 0;
 
-	asf = (struct xfs_attr_shortform *) XFS_DFORK_APTR(dip);
-
 	/* Assumption: hdr.totsize is less than a leaf block and was checked
 	 * by lclinode for valid sizes. Check the count though.
 	*/
-	if (asf->hdr.count == 0)
+	if (hdr->count == 0)
 		/* then the total size should just be the header length */
-		if (be16_to_cpu(asf->hdr.totsize) != sizeof(xfs_attr_sf_hdr_t)) {
+		if (be16_to_cpu(hdr->totsize) != sizeof(struct xfs_attr_sf_hdr)) {
 			/* whoops there's a discrepancy. Clear the hdr */
 			if (!no_modify) {
 				do_warn(
 	_("there are no attributes in the fork for inode %" PRIu64 "\n"),
 					ino);
-				asf->hdr.totsize =
-					cpu_to_be16(sizeof(xfs_attr_sf_hdr_t));
+				hdr->totsize =
+					cpu_to_be16(sizeof(struct xfs_attr_sf_hdr));
 				*repair = 1;
 				return(1);
 			} else {
@@ -242,16 +241,16 @@ process_shortform_attr(
 			}
 		}
 
-	currentsize = sizeof(xfs_attr_sf_hdr_t);
-	remainingspace = be16_to_cpu(asf->hdr.totsize) - currentsize;
-	nextentry = &asf->list[0];
-	for (i = 0; i < asf->hdr.count; i++)  {
+	currentsize = sizeof(struct xfs_attr_sf_hdr);
+	remainingspace = be16_to_cpu(hdr->totsize) - currentsize;
+	nextentry = libxfs_attr_sf_firstentry(hdr);
+	for (i = 0; i < hdr->count; i++)  {
 		currententry = nextentry;
 		junkit = 0;
 
 		/* don't go off the end if the hdr.count was off */
 		if ((currentsize + (sizeof(struct xfs_attr_sf_entry) - 1)) >
-						be16_to_cpu(asf->hdr.totsize))
+						be16_to_cpu(hdr->totsize))
 			break; /* get out and reset count and totSize */
 
 		/* if the namelen is 0, can't get to the rest of the entries */
@@ -292,8 +291,23 @@ process_shortform_attr(
 			}
 		}
 
+		if (currententry->flags & ~XFS_ATTR_ONDISK_MASK) {
+			do_warn(
+	_("unknown flags 0x%x in shortform attribute %d in inode %" PRIu64 "\n"),
+				currententry->flags, i, ino);
+			junkit = 1;
+		}
+
+		if (!libxfs_attr_check_namespace(currententry->flags)) {
+			do_warn(
+	_("multiple namespaces for shortform attribute %d in inode %" PRIu64 "\n"),
+				i, ino);
+			junkit = 1;
+		}
+
 		/* namecheck checks for null chars in attr names. */
-		if (!libxfs_attr_namecheck(currententry->nameval,
+		if (!libxfs_attr_namecheck(currententry->flags,
+					   currententry->nameval,
 					   currententry->namelen)) {
 			do_warn(
 	_("entry contains illegal character in shortform attribute name\n"));
@@ -313,6 +327,13 @@ process_shortform_attr(
 					NULL, currententry->namelen,
 					currententry->valuelen);
 
+		if ((currententry->flags & XFS_ATTR_PARENT) &&
+		    !xfs_has_parent(mp)) {
+			do_warn(
+ _("parent pointer found on filesystem that doesn't support parent pointers\n"));
+			junkit |= 1;
+		}
+
 		remainingspace = remainingspace -
 					xfs_attr_sf_entsize(currententry);
 
@@ -326,7 +347,7 @@ process_shortform_attr(
 					((intptr_t) currententry +
 					 xfs_attr_sf_entsize(currententry));
 				memmove(currententry,tempentry,remainingspace);
-				asf->hdr.count -= 1;
+				hdr->count -= 1;
 				i--; /* no worries, it will wrap back to 0 */
 				*repair = 1;
 				continue; /* go back up now */
@@ -344,33 +365,49 @@ process_shortform_attr(
 
 	} /* end the loop */
 
-	if (asf->hdr.count != i)  {
+	if (hdr->count != i)  {
 		if (no_modify)  {
 			do_warn(
 	_("would have corrected attribute entry count in inode %" PRIu64 " from %d to %d\n"),
-				ino, asf->hdr.count, i);
+				ino, hdr->count, i);
 		} else  {
 			do_warn(
 	_("corrected attribute entry count in inode %" PRIu64 ", was %d, now %d\n"),
-				ino, asf->hdr.count, i);
-			asf->hdr.count = i;
+				ino, hdr->count, i);
+			hdr->count = i;
 			*repair = 1;
 		}
 	}
 
 	/* ASSUMPTION: currentsize <= totsize */
-	if (be16_to_cpu(asf->hdr.totsize) != currentsize)  {
+	if (be16_to_cpu(hdr->totsize) != currentsize)  {
 		if (no_modify)  {
 			do_warn(
 	_("would have corrected attribute totsize in inode %" PRIu64 " from %d to %d\n"),
-				ino, be16_to_cpu(asf->hdr.totsize),
+				ino, be16_to_cpu(hdr->totsize),
 				currentsize);
 		} else  {
 			do_warn(
 	_("corrected attribute entry totsize in inode %" PRIu64 ", was %d, now %d\n"),
-				ino, be16_to_cpu(asf->hdr.totsize),
+				ino, be16_to_cpu(hdr->totsize),
 				currentsize);
-			asf->hdr.totsize = cpu_to_be16(currentsize);
+			hdr->totsize = cpu_to_be16(currentsize);
+			*repair = 1;
+		}
+	}
+
+	fa = libxfs_attr_shortform_verify(hdr, be16_to_cpu(hdr->totsize));
+	if (fa) {
+		if (no_modify) {
+			do_warn(
+	_("inode %" PRIu64 " shortform attr verifier failure, would have cleared attrs\n"),
+				ino);
+		} else {
+			do_warn(
+	_("inode %" PRIu64 " shortform attr verifier failure, cleared attrs\n"),
+				ino);
+			hdr->count = 0;
+			hdr->totsize = cpu_to_be16(sizeof(struct xfs_attr_sf_hdr));
 			*repair = 1;
 		}
 	}
@@ -455,10 +492,11 @@ process_leaf_attr_local(
 	xfs_ino_t		ino)
 {
 	xfs_attr_leaf_name_local_t *local;
+	xfs_dahash_t		computed;
 
 	local = xfs_attr3_leaf_name_local(leaf, i);
 	if (local->namelen == 0 ||
-	    !libxfs_attr_namecheck(local->nameval,
+	    !libxfs_attr_namecheck(entry->flags, local->nameval,
 				   local->namelen)) {
 		do_warn(
 	_("attribute entry %d in attr block %u, inode %" PRIu64 " has bad name (namelen = %d)\n"),
@@ -474,9 +512,12 @@ process_leaf_attr_local(
 	 * ordering anyway in case both the name value and the
 	 * hashvalue were wrong but matched. Unlikely, however.
 	 */
-	if (be32_to_cpu(entry->hashval) != libxfs_da_hashname(
-				&local->nameval[0], local->namelen) ||
-				be32_to_cpu(entry->hashval) < last_hashval) {
+	computed = libxfs_attr_hashval(mp, entry->flags, local->nameval,
+				       local->namelen,
+				       local->nameval + local->namelen,
+				       be16_to_cpu(local->valuelen));
+	if (be32_to_cpu(entry->hashval) != computed ||
+	    be32_to_cpu(entry->hashval) < last_hashval) {
 		do_warn(
 	_("bad hashvalue for attribute entry %d in attr block %u, inode %" PRIu64 "\n"),
 			i, da_bno, ino);
@@ -493,6 +534,15 @@ process_leaf_attr_local(
 			return -1;
 		}
 	}
+
+	if ((entry->flags & XFS_ATTR_PARENT) && !xfs_has_parent(mp)) {
+		do_warn(
+ _("parent pointer found in attribute entry %d in attr block %u, inode %"
+   PRIu64 " on filesystem that doesn't support parent pointers\n"),
+				i, da_bno, ino);
+		return -1;
+	}
+
 	return xfs_attr_leaf_entsize_local(local->namelen,
 						be16_to_cpu(local->valuelen));
 }
@@ -510,19 +560,35 @@ process_leaf_attr_remote(
 {
 	xfs_attr_leaf_name_remote_t *remotep;
 	char*			value;
+	xfs_dahash_t		computed;
 
 	remotep = xfs_attr3_leaf_name_remote(leaf, i);
 
+	computed = libxfs_attr_hashval(mp, entry->flags, remotep->name,
+				       remotep->namelen, NULL,
+				       be32_to_cpu(remotep->valuelen));
 	if (remotep->namelen == 0 ||
-	    !libxfs_attr_namecheck(remotep->name,
+	    !libxfs_attr_namecheck(entry->flags, remotep->name,
 				   remotep->namelen) ||
-	    be32_to_cpu(entry->hashval) !=
-			libxfs_da_hashname((unsigned char *)&remotep->name[0],
-					   remotep->namelen) ||
+	    be32_to_cpu(entry->hashval) != computed ||
 	    be32_to_cpu(entry->hashval) < last_hashval ||
 	    be32_to_cpu(remotep->valueblk) == 0) {
 		do_warn(
 	_("inconsistent remote attribute entry %d in attr block %u, ino %" PRIu64 "\n"), i, da_bno, ino);
+		return -1;
+	}
+
+	if (entry->flags & XFS_ATTR_PARENT) {
+		if (!xfs_has_parent(mp))
+			do_warn(
+ _("parent pointer found in attribute entry %d in attr block %u, inode %"
+   PRIu64 " on filesystem that doesn't support parent pointers\n"),
+					i, da_bno, ino);
+		else
+			do_warn(
+ _("parent pointer found in attribute entry %d in attr block %u, inode %"
+   PRIu64 " with bogus remote value\n"),
+					i, da_bno, ino);
 		return -1;
 	}
 
@@ -574,10 +640,30 @@ process_leaf_attr_block(
 	da_freemap_t *attr_freemap;
 	struct xfs_attr3_icleaf_hdr leafhdr;
 
-	xfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, leaf);
+	libxfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, leaf);
 	clearit = usedbs = 0;
 	firstb = mp->m_sb.sb_blocksize;
 	stop = xfs_attr3_leaf_hdr_size(leaf);
+
+	/*
+	 * Empty leaf blocks at offset zero can occur as a race between
+	 * setxattr and the system going down, so we only take action if we're
+	 * running in modify mode.  See xfs_attr3_leaf_verify for details of
+	 * how we've screwed this up many times.
+	 */
+	if (!leafhdr.count && da_bno == 0) {
+		if (no_modify) {
+			do_log(
+	_("would clear empty leaf attr block 0, inode %" PRIu64 "\n"),
+					ino);
+			return 0;
+		}
+
+		do_warn(
+	_("will clear empty leaf attr block 0, inode %" PRIu64 "\n"),
+				ino);
+		return 1;
+	}
 
 	/* does the count look sorta valid? */
 	if (!leafhdr.count ||
@@ -601,6 +687,22 @@ process_leaf_attr_block(
 			do_warn(
 	_("bad attribute nameidx %d in attr block %u, inode %" PRIu64 "\n"),
 				be16_to_cpu(entry->nameidx), da_bno, ino);
+			clearit = 1;
+			break;
+		}
+
+		if (entry->flags & ~XFS_ATTR_ONDISK_MASK) {
+			do_warn(
+	_("unknown flags 0x%x in attribute entry #%d in attr block %u, inode %" PRIu64 "\n"),
+				entry->flags, i, da_bno, ino);
+			clearit = 1;
+			break;
+		}
+
+		if (!libxfs_attr_check_namespace(entry->flags)) {
+			do_warn(
+	_("multiple namespaces for attribute entry %d in attr block %u, inode %" PRIu64 "\n"),
+				i, da_bno, ino);
 			clearit = 1;
 			break;
 		}
@@ -777,7 +879,7 @@ process_leaf_attr_level(xfs_mount_t	*mp,
 		}
 
 		leaf = bp->b_addr;
-		xfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, leaf);
+		libxfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, leaf);
 
 		/* check magic number for leaf directory btree block */
 		if (!(leafhdr.magic == XFS_ATTR_LEAF_MAGIC ||
@@ -835,8 +937,13 @@ process_leaf_attr_level(xfs_mount_t	*mp,
 		 * If block looks ok but CRC didn't match, make sure to
 		 * recompute it.
 		 */
-		if (!no_modify && bp->b_error == -EFSBADCRC)
-			repair++;
+		if (bp->b_error == -EFSBADCRC) {
+			do_warn(
+ _("bad checksum for block %u in attribute fork for inode %" PRIu64 "\n"),
+				da_bno, ino);
+			if (!no_modify)
+				repair++;
+		}
 
 		if (repair && !no_modify) {
 			libxfs_buf_mark_dirty(bp);
@@ -975,7 +1082,7 @@ process_longform_leaf_root(
 	 * check sibling pointers in leaf block or root block 0 before
 	 * we have to release the btree block
 	 */
-	xfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, bp->b_addr);
+	libxfs_attr3_leaf_hdr_from_disk(mp->m_attr_geo, &leafhdr, bp->b_addr);
 	if (leafhdr.forw != 0 || leafhdr.back != 0)  {
 		if (!no_modify)  {
 			do_warn(
@@ -1083,7 +1190,7 @@ process_longform_attr(
 	bno = blkmap_get(blkmap, 0);
 	if (bno == NULLFSBLOCK) {
 		if (dip->di_aformat == XFS_DINODE_FMT_EXTENTS &&
-				be16_to_cpu(dip->di_anextents) == 0)
+				xfs_dfork_attr_extents(dip) == 0)
 			return(0); /* the kernel can handle this state */
 		do_warn(
 	_("block 0 of inode %" PRIu64 " attribute fork is missing\n"),
@@ -1116,8 +1223,12 @@ process_longform_attr(
 		return 1;
 	}
 
-	if (bp->b_error == -EFSBADCRC)
+	if (bp->b_error == -EFSBADCRC) {
+		do_warn(
+ _("bad checksum for block 0 in attribute fork for inode %" PRIu64 "\n"),
+				ino);
 		(*repair)++;
+	}
 
 	/* is this block sane? */
 	if (__check_attr_header(mp, bp, ino)) {
@@ -1212,14 +1323,12 @@ process_attributes(
 	int			err;
 	__u8			aformat = dip->di_aformat;
 #ifdef DEBUG
-	struct xfs_attr_shortform *asf;
-
-	asf = (struct xfs_attr_shortform *) XFS_DFORK_APTR(dip);
+	struct xfs_attr_sf_hdr	*hdr = XFS_DFORK_APTR(dip);
 #endif
 
 	if (aformat == XFS_DINODE_FMT_LOCAL) {
-		ASSERT(be16_to_cpu(asf->hdr.totsize) <=
-			XFS_DFORK_ASIZE(dip, mp));
+		ASSERT(be16_to_cpu(hdr->totsize) <= XFS_DFORK_ASIZE(dip, mp));
+
 		err = process_shortform_attr(mp, ino, dip, repair);
 	} else if (aformat == XFS_DINODE_FMT_EXTENTS ||
 					aformat == XFS_DINODE_FMT_BTREE)  {

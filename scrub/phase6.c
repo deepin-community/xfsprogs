@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #include "xfs.h"
 #include <stdint.h>
@@ -21,6 +21,8 @@
 #include "read_verify.h"
 #include "spacemap.h"
 #include "vfs.h"
+#include "common.h"
+#include "libfrog/bulkstat.h"
 
 /*
  * Phase 6: Verify data file integrity.
@@ -291,13 +293,14 @@ report_inode_loss(
 	/* Try to open the inode. */
 	fd = scrub_open_handle(handle);
 	if (fd < 0) {
-		error = errno;
-		if (error == ESTALE)
-			return error;
+		/* Handle is stale, try again. */
+		if (errno == ESTALE)
+			return ESTALE;
 
-		str_info(ctx, descr,
-_("Disappeared during read error reporting."));
-		return error;
+		str_error(ctx, descr,
+ _("Could not open to report read errors: %s."),
+				strerror(errno));
+		return 0;
 	}
 
 	/* Go find the badness. */
@@ -353,10 +356,18 @@ report_dirent_loss(
 	fd = openat(dir_fd, dirent->d_name,
 			O_RDONLY | O_NOATIME | O_NOFOLLOW | O_NOCTTY);
 	if (fd < 0) {
+		char		descr[PATH_MAX + 1];
+
 		if (errno == ENOENT)
 			return 0;
-		str_errno(ctx, path);
-		return errno;
+
+		snprintf(descr, PATH_MAX, "%s/%s", path, dirent->d_name);
+		descr[PATH_MAX] = 0;
+
+		str_error(ctx, descr,
+ _("Could not open to report read errors: %s."),
+				strerror(errno));
+		return 0;
 	}
 
 	/* Go find the badness. */
@@ -371,6 +382,24 @@ report_dirent_loss(
 	return error;
 }
 
+struct ioerr_filerange {
+	uint64_t		physical;
+	uint64_t		length;
+};
+
+/*
+ * If reverse mapping and parent pointers are enabled, we can map media errors
+ * directly back to a filename and a file position without needing to walk the
+ * directory tree.
+ */
+static inline bool
+can_use_pptrs(
+	const struct scrub_ctx	*ctx)
+{
+	return  (ctx->mnt.fsgeom.flags & XFS_FSOP_GEOM_FLAGS_PARENT) &&
+		(ctx->mnt.fsgeom.flags & XFS_FSOP_GEOM_FLAGS_RMAPBT);
+}
+
 /* Use a fsmap to report metadata lost to a media error. */
 static int
 report_ioerr_fsmap(
@@ -379,16 +408,18 @@ report_ioerr_fsmap(
 	void			*arg)
 {
 	const char		*type;
+	struct xfs_bulkstat	bs = { };
 	char			buf[DESCR_BUFSZ];
-	uint64_t		err_physical = *(uint64_t *)arg;
+	struct ioerr_filerange	*fr = arg;
 	uint64_t		err_off;
+	int			ret;
 
 	/* Don't care about unwritten extents. */
 	if (map->fmr_flags & FMR_OF_PREALLOC)
 		return 0;
 
-	if (err_physical > map->fmr_physical)
-		err_off = err_physical - map->fmr_physical;
+	if (fr->physical > map->fmr_physical)
+		err_off = fr->physical - map->fmr_physical;
 	else
 		err_off = 0;
 
@@ -397,7 +428,25 @@ report_ioerr_fsmap(
 		snprintf(buf, DESCR_BUFSZ, _("disk offset %"PRIu64),
 				(uint64_t)map->fmr_physical + err_off);
 		type = decode_special_owner(map->fmr_owner);
-		str_corrupt(ctx, buf, _("media error in %s."), type);
+		/*
+		 * On filesystems that don't store reverse mappings, the
+		 * GETFSMAP call returns OWNER_UNKNOWN for allocated space.
+		 * We'll have to let the directory tree walker find the file
+		 * that lost data.
+		 */
+		if (!(ctx->mnt.fsgeom.flags & XFS_FSOP_GEOM_FLAGS_RMAPBT) &&
+		    map->fmr_owner == XFS_FMR_OWN_UNKNOWN) {
+			str_info(ctx, buf, _("media error detected."));
+		} else {
+			str_corrupt(ctx, buf, _("media error in %s."), type);
+		}
+	}
+
+	if (can_use_pptrs(ctx)) {
+		ret = -xfrog_bulkstat_single(&ctx->mnt, map->fmr_owner, 0, &bs);
+		if (ret)
+			str_liberror(ctx, ret,
+					_("bulkstat for media error report"));
 	}
 
 	/* Report extent maps */
@@ -405,18 +454,31 @@ report_ioerr_fsmap(
 		bool		attr = (map->fmr_flags & FMR_OF_ATTR_FORK);
 
 		scrub_render_ino_descr(ctx, buf, DESCR_BUFSZ,
-				map->fmr_owner, 0, " %s",
+				map->fmr_owner, bs.bs_gen, " %s",
 				attr ? _("extended attribute") :
 				       _("file data"));
 		str_corrupt(ctx, buf, _("media error in extent map"));
 	}
 
 	/*
-	 * XXX: If we had a getparent() call we could report IO errors
-	 * efficiently.  Until then, we'll have to scan the dir tree
-	 * to find the bad file's pathname.
+	 * If directory parent pointers are available, use that to find the
+	 * pathname to a file, and report that path as having lost its
+	 * extended attributes, or the precise offset of the lost file data.
 	 */
+	if (!can_use_pptrs(ctx))
+		return 0;
 
+	scrub_render_ino_descr(ctx, buf, DESCR_BUFSZ, map->fmr_owner,
+			bs.bs_gen, NULL);
+
+	if (map->fmr_flags & FMR_OF_ATTR_FORK) {
+		str_corrupt(ctx, buf, _("media error in extended attributes"));
+		return 0;
+	}
+
+	str_unfixable_error(ctx, buf,
+ _("media error at data offset %llu length %llu."),
+			err_off, fr->length);
 	return 0;
 }
 
@@ -431,6 +493,10 @@ report_ioerr(
 	void				*arg)
 {
 	struct fsmap			keys[2];
+	struct ioerr_filerange		fr = {
+		.physical		= start,
+		.length			= length,
+	};
 	struct disk_ioerr_report	*dioerr = arg;
 	dev_t				dev;
 
@@ -446,7 +512,7 @@ report_ioerr(
 	(keys + 1)->fmr_offset = ULLONG_MAX;
 	(keys + 1)->fmr_flags = UINT_MAX;
 	return -scrub_iterate_fsmap(dioerr->ctx, keys, report_ioerr_fsmap,
-			&start);
+			&fr);
 }
 
 /* Report all the media errors found on a disk. */
@@ -490,10 +556,16 @@ report_all_media_errors(
 		return ret;
 	}
 
-	/* Scan the directory tree to get file paths. */
-	ret = scan_fs_tree(ctx, report_dir_loss, report_dirent_loss, vs);
-	if (ret)
-		return ret;
+	/*
+	 * Scan the directory tree to get file paths if we didn't already use
+	 * directory parent pointers to report the loss.
+	 */
+	if (!can_use_pptrs(ctx)) {
+		ret = scan_fs_tree(ctx, report_dir_loss, report_dirent_loss,
+				vs);
+		if (ret)
+			return ret;
+	}
 
 	/* Scan for unlinked files. */
 	return scrub_scan_all_inodes(ctx, report_inode_loss, vs);
@@ -732,7 +804,17 @@ phase6_estimate(
 
 	*items = cvt_off_fsb_to_b(&ctx->mnt,
 			(d_blocks - d_bfree) + (r_blocks - r_bfree));
+
+	/*
+	 * Each read-verify pool starts a thread pool, and each worker thread
+	 * can contribute to the progress counter.  Hence we need to set
+	 * nr_threads appropriately to handle that many threads.
+	 */
 	*nr_threads = disk_heads(ctx->datadev);
+	if (ctx->rtdev)
+		*nr_threads += disk_heads(ctx->rtdev);
+	if (ctx->logdev)
+		*nr_threads += disk_heads(ctx->logdev);
 	*rshift = 20;
 	return 0;
 }

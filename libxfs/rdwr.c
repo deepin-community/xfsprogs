@@ -18,7 +18,8 @@
 #include "xfs_inode.h"
 #include "xfs_trans.h"
 #include "libfrog/platform.h"
-
+#include "libxfs/xfile.h"
+#include "libxfs/buf_mem.h"
 #include "libxfs.h"
 
 static void libxfs_brelse(struct cache_node *node);
@@ -62,18 +63,21 @@ static void libxfs_brelse(struct cache_node *node);
 int
 libxfs_device_zero(struct xfs_buftarg *btp, xfs_daddr_t start, uint len)
 {
+	int		fd = btp->bt_bdev_fd;
 	xfs_off_t	start_offset, end_offset, offset;
 	ssize_t		zsize, bytes;
 	size_t		len_bytes;
 	char		*z;
-	int		error, fd;
+	int		error;
 
-	fd = libxfs_device_to_fd(btp->bt_bdev);
+	if (xfs_buftarg_is_mem(btp))
+		return -EOPNOTSUPP;
+
 	start_offset = LIBXFS_BBTOOFF64(start);
 
 	/* try to use special zeroing methods, fall back to writes if needed */
 	len_bytes = LIBXFS_BBTOOFF64(len);
-	error = platform_zero_range(fd, start_offset, len_bytes);
+	error = fallocate(fd, FALLOC_FL_ZERO_RANGE, start_offset, len_bytes);
 	if (!error) {
 		xfs_buftarg_trip_write(btp);
 		return 0;
@@ -167,26 +171,10 @@ static struct cache_mru		xfs_buf_freelist =
 	{{&xfs_buf_freelist.cm_list, &xfs_buf_freelist.cm_list},
 	 0, PTHREAD_MUTEX_INITIALIZER };
 
-/*
- * The bufkey is used to pass the new buffer information to the cache object
- * allocation routine. Because discontiguous buffers need to pass different
- * information, we need fields to pass that information. However, because the
- * blkno and bblen is needed for the initial cache entry lookup (i.e. for
- * bcompare) the fact that the map/nmaps is non-null to switch to discontiguous
- * buffer initialisation instead of a contiguous buffer.
- */
-struct xfs_bufkey {
-	struct xfs_buftarg	*buftarg;
-	xfs_daddr_t		blkno;
-	unsigned int		bblen;
-	struct xfs_buf_map	*map;
-	int			nmaps;
-};
-
 /*  2^63 + 2^61 - 2^57 + 2^54 - 2^51 - 2^18 + 1 */
 #define GOLDEN_RATIO_PRIME	0x9e37fffffffc0001UL
 #define CACHE_LINE_SIZE		64
-static unsigned int
+unsigned int
 libxfs_bhash(cache_key_t key, unsigned int hashsize, unsigned int hashshift)
 {
 	uint64_t	hashval = ((struct xfs_bufkey *)key)->blkno;
@@ -197,19 +185,21 @@ libxfs_bhash(cache_key_t key, unsigned int hashsize, unsigned int hashshift)
 	return tmp % hashsize;
 }
 
-static int
-libxfs_bcompare(struct cache_node *node, cache_key_t key)
+int
+libxfs_bcompare(
+	struct cache_node	*node,
+	cache_key_t		key)
 {
 	struct xfs_buf		*bp = container_of(node, struct xfs_buf,
 						   b_node);
 	struct xfs_bufkey	*bkey = (struct xfs_bufkey *)key;
+	struct cache		*bcache = bkey->buftarg->bcache;
 
-	if (bp->b_target->bt_bdev == bkey->buftarg->bt_bdev &&
-	    bp->b_cache_key == bkey->blkno) {
+	if (bp->b_cache_key == bkey->blkno) {
 		if (bp->b_length == bkey->bblen)
 			return CACHE_HIT;
 #ifdef IO_BCOMPARE_CHECK
-		if (!(libxfs_bcache->c_flags & CACHE_MISCOMPARE_PURGE)) {
+		if (!(bcache->c_flags & CACHE_MISCOMPARE_PURGE)) {
 			fprintf(stderr,
 	"%lx: Badness in key lookup (length)\n"
 	"bp=(bno 0x%llx, len %u bytes) key=(bno 0x%llx, len %u bytes)\n",
@@ -229,6 +219,8 @@ static void
 __initbuf(struct xfs_buf *bp, struct xfs_buftarg *btp, xfs_daddr_t bno,
 		unsigned int bytes)
 {
+	ASSERT(!xfs_buftarg_is_mem(btp));
+
 	bp->b_flags = 0;
 	bp->b_cache_key = bno;
 	bp->b_length = BTOBB(bytes);
@@ -376,6 +368,22 @@ libxfs_getbufr_map(struct xfs_buftarg *btp, xfs_daddr_t blkno, int bblen,
 	return bp;
 }
 
+void
+xfs_buf_lock(
+	struct xfs_buf	*bp)
+{
+	if (use_xfs_buf_lock)
+		pthread_mutex_lock(&bp->b_lock);
+}
+
+void
+xfs_buf_unlock(
+	struct xfs_buf	*bp)
+{
+	if (use_xfs_buf_lock)
+		pthread_mutex_unlock(&bp->b_lock);
+}
+
 static int
 __cache_lookup(
 	struct xfs_bufkey	*key,
@@ -383,11 +391,12 @@ __cache_lookup(
 	struct xfs_buf		**bpp)
 {
 	struct cache_node	*cn = NULL;
+	struct cache		*bcache = key->buftarg->bcache;
 	struct xfs_buf		*bp;
 
 	*bpp = NULL;
 
-	cache_node_get(libxfs_bcache, key, &cn);
+	cache_node_get(bcache, key, &cn);
 	if (!cn)
 		return -ENOMEM;
 	bp = container_of(cn, struct xfs_buf, b_node);
@@ -399,7 +408,7 @@ __cache_lookup(
 		if (ret) {
 			ASSERT(ret == EAGAIN);
 			if (flags & LIBXFS_GETBUF_TRYLOCK) {
-				cache_node_put(libxfs_bcache, cn);
+				cache_node_put(bcache, cn);
 				return -EAGAIN;
 			}
 
@@ -418,7 +427,7 @@ __cache_lookup(
 		bp->b_holder = pthread_self();
 	}
 
-	cache_node_set_priority(libxfs_bcache, cn,
+	cache_node_set_priority(bcache, cn,
 			cache_node_get_priority(cn) - CACHE_PREFETCH_PRIORITY);
 	*bpp = bp;
 	return 0;
@@ -534,7 +543,7 @@ libxfs_buf_relse(
 	}
 
 	if (!list_empty(&bp->b_node.cn_hash))
-		cache_node_put(libxfs_bcache, &bp->b_node);
+		cache_node_put(bp->b_target->bcache, &bp->b_node);
 	else if (--bp->b_node.cn_count == 0) {
 		if (bp->b_flags & LIBXFS_B_DIRTY)
 			libxfs_bwrite(bp);
@@ -558,9 +567,8 @@ libxfs_balloc(
 	return &bp->b_node;
 }
 
-
 static int
-__read_buf(int fd, void *buf, int len, off64_t offset, int flags)
+__read_buf(int fd, void *buf, int len, off_t offset, int flags)
 {
 	int	sts;
 
@@ -582,15 +590,18 @@ int
 libxfs_readbufr(struct xfs_buftarg *btp, xfs_daddr_t blkno, struct xfs_buf *bp,
 		int len, int flags)
 {
-	int	fd = libxfs_device_to_fd(btp->bt_bdev);
+	int	fd = btp->bt_bdev_fd;
 	int	bytes = BBTOB(len);
 	int	error;
 
 	ASSERT(len <= bp->b_length);
 
+	if (xfs_buftarg_is_mem(btp))
+		return 0;
+
 	error = __read_buf(fd, bp->b_addr, bytes, LIBXFS_BBTOOFF64(blkno), flags);
 	if (!error &&
-	    bp->b_target->bt_bdev == btp->bt_bdev &&
+	    bp->b_target == btp &&
 	    bp->b_cache_key == blkno &&
 	    bp->b_length == len)
 		bp->b_flags |= LIBXFS_B_UPTODATE;
@@ -615,15 +626,17 @@ libxfs_readbuf_verify(
 int
 libxfs_readbufr_map(struct xfs_buftarg *btp, struct xfs_buf *bp, int flags)
 {
-	int	fd;
+	int	fd = btp->bt_bdev_fd;
 	int	error = 0;
 	void	*buf;
 	int	i;
 
-	fd = libxfs_device_to_fd(btp->bt_bdev);
+	if (xfs_buftarg_is_mem(btp))
+		return 0;
+
 	buf = bp->b_addr;
 	for (i = 0; i < bp->b_nmaps; i++) {
-		off64_t	offset = LIBXFS_BBTOOFF64(bp->b_maps[i].bm_bn);
+		off_t	offset = LIBXFS_BBTOOFF64(bp->b_maps[i].bm_bn);
 		int len = BBTOB(bp->b_maps[i].bm_len);
 
 		error = __read_buf(fd, buf, len, offset, flags);
@@ -782,7 +795,7 @@ err:
 }
 
 static int
-__write_buf(int fd, void *buf, int len, off64_t offset, int flags)
+__write_buf(int fd, void *buf, int len, off_t offset, int flags)
 {
 	int	sts;
 
@@ -804,7 +817,7 @@ int
 libxfs_bwrite(
 	struct xfs_buf	*bp)
 {
-	int		fd = libxfs_device_to_fd(bp->b_target->bt_bdev);
+	int		fd = bp->b_target->bt_bdev_fd;
 
 	/*
 	 * we never write buffers that are marked stale. This indicates they
@@ -839,7 +852,9 @@ libxfs_bwrite(
 		}
 	}
 
-	if (!(bp->b_flags & LIBXFS_B_DISCONTIG)) {
+	if (xfs_buftarg_is_mem(bp->b_target)) {
+		bp->b_error = 0;
+	} else if (!(bp->b_flags & LIBXFS_B_DISCONTIG)) {
 		bp->b_error = __write_buf(fd, bp->b_addr, BBTOB(bp->b_length),
 				    LIBXFS_BBTOOFF64(xfs_buf_daddr(bp)),
 				    bp->b_flags);
@@ -848,7 +863,7 @@ libxfs_bwrite(
 		void	*buf = bp->b_addr;
 
 		for (i = 0; i < bp->b_nmaps; i++) {
-			off64_t	offset = LIBXFS_BBTOOFF64(bp->b_maps[i].bm_bn);
+			off_t	offset = LIBXFS_BBTOOFF64(bp->b_maps[i].bm_bn);
 			int len = BBTOB(bp->b_maps[i].bm_len);
 
 			bp->b_error = __write_buf(fd, buf, len, offset,
@@ -887,7 +902,7 @@ libxfs_buf_mark_dirty(
 	 */
 	bp->b_error = 0;
 	bp->b_flags &= ~LIBXFS_B_STALE;
-	bp->b_flags |= LIBXFS_B_DIRTY;
+	bp->b_flags |= LIBXFS_B_DIRTY | LIBXFS_B_UPTODATE;
 }
 
 /* Prepare a buffer to be sent to the MRU list. */
@@ -898,6 +913,8 @@ libxfs_buf_prepare_mru(
 	if (bp->b_pag)
 		xfs_perag_put(bp->b_pag);
 	bp->b_pag = NULL;
+
+	ASSERT(!xfs_buftarg_is_mem(btp));
 
 	if (!(bp->b_flags & LIBXFS_B_DIRTY))
 		return;
@@ -988,21 +1005,31 @@ libxfs_bflush(
 }
 
 void
-libxfs_bcache_purge(void)
+libxfs_bcache_purge(struct xfs_mount *mp)
 {
-	cache_purge(libxfs_bcache);
+	if (!mp)
+		return;
+	cache_purge(mp->m_ddev_targp->bcache);
+	cache_purge(mp->m_logdev_targp->bcache);
+	cache_purge(mp->m_rtdev_targp->bcache);
 }
 
 void
-libxfs_bcache_flush(void)
+libxfs_bcache_flush(struct xfs_mount *mp)
 {
-	cache_flush(libxfs_bcache);
+	if (!mp)
+		return;
+	cache_flush(mp->m_ddev_targp->bcache);
+	cache_flush(mp->m_logdev_targp->bcache);
+	cache_flush(mp->m_rtdev_targp->bcache);
 }
 
 int
-libxfs_bcache_overflowed(void)
+libxfs_bcache_overflowed(struct xfs_mount *mp)
 {
-	return cache_overflowed(libxfs_bcache);
+	return cache_overflowed(mp->m_ddev_targp->bcache) ||
+		cache_overflowed(mp->m_logdev_targp->bcache) ||
+		cache_overflowed(mp->m_rtdev_targp->bcache);
 }
 
 struct cache_operations libxfs_bcache_operations = {
@@ -1053,93 +1080,6 @@ xfs_verify_magic16(
 }
 
 /*
- * Inode cache stubs.
- */
-
-struct kmem_cache		*xfs_inode_cache;
-extern struct kmem_cache	*xfs_ili_cache;
-
-int
-libxfs_iget(
-	struct xfs_mount	*mp,
-	struct xfs_trans	*tp,
-	xfs_ino_t		ino,
-	uint			lock_flags,
-	struct xfs_inode	**ipp)
-{
-	struct xfs_inode	*ip;
-	struct xfs_buf		*bp;
-	int			error = 0;
-
-	ip = kmem_cache_zalloc(xfs_inode_cache, 0);
-	if (!ip)
-		return -ENOMEM;
-
-	VFS_I(ip)->i_count = 1;
-	ip->i_ino = ino;
-	ip->i_mount = mp;
-	spin_lock_init(&VFS_I(ip)->i_lock);
-
-	error = xfs_imap(mp, tp, ip->i_ino, &ip->i_imap, 0);
-	if (error)
-		goto out_destroy;
-
-	error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &bp);
-	if (error)
-		goto out_destroy;
-
-	error = xfs_inode_from_disk(ip,
-			xfs_buf_offset(bp, ip->i_imap.im_boffset));
-	if (!error)
-		xfs_buf_set_ref(bp, XFS_INO_REF);
-	xfs_trans_brelse(tp, bp);
-
-	if (error)
-		goto out_destroy;
-
-	*ipp = ip;
-	return 0;
-
-out_destroy:
-	kmem_cache_free(xfs_inode_cache, ip);
-	*ipp = NULL;
-	return error;
-}
-
-static void
-libxfs_idestroy(xfs_inode_t *ip)
-{
-	switch (VFS_I(ip)->i_mode & S_IFMT) {
-		case S_IFREG:
-		case S_IFDIR:
-		case S_IFLNK:
-			libxfs_idestroy_fork(&ip->i_df);
-			break;
-	}
-	if (ip->i_afp) {
-		libxfs_idestroy_fork(ip->i_afp);
-		kmem_cache_free(xfs_ifork_cache, ip->i_afp);
-	}
-	if (ip->i_cowfp) {
-		libxfs_idestroy_fork(ip->i_cowfp);
-		kmem_cache_free(xfs_ifork_cache, ip->i_cowfp);
-	}
-}
-
-void
-libxfs_irele(
-	struct xfs_inode	*ip)
-{
-	VFS_I(ip)->i_count--;
-
-	if (VFS_I(ip)->i_count == 0) {
-		ASSERT(ip->i_itemp == NULL);
-		libxfs_idestroy(ip);
-		kmem_cache_free(xfs_inode_cache, ip);
-	}
-}
-
-/*
  * Flush everything dirty in the kernel and disk write caches to stable media.
  * Returns 0 for success or a negative error code.
  */
@@ -1147,13 +1087,12 @@ int
 libxfs_blkdev_issue_flush(
 	struct xfs_buftarg	*btp)
 {
-	int			fd, ret;
+	int			ret;
 
 	if (btp->bt_bdev == 0)
 		return 0;
 
-	fd = libxfs_device_to_fd(btp->bt_bdev);
-	ret = platform_flush_device(fd, btp->bt_bdev);
+	ret = platform_flush_device(btp->bt_bdev_fd, btp->bt_bdev);
 	return ret ? -errno : 0;
 }
 
@@ -1444,7 +1383,7 @@ libxfs_buf_set_priority(
 	struct xfs_buf	*bp,
 	int		priority)
 {
-	cache_node_set_priority(libxfs_bcache, &bp->b_node, priority);
+	cache_node_set_priority(bp->b_target->bcache, &bp->b_node, priority);
 }
 
 int

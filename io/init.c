@@ -56,6 +56,7 @@ init_commands(void)
 	flink_init();
 	freeze_init();
 	fsmap_init();
+	fsuuid_init();
 	fsync_init();
 	getrusage_init();
 	help_init();
@@ -87,6 +88,8 @@ init_commands(void)
 	truncate_init();
 	utimes_init();
 	crc32cselftest_init();
+	exchangerange_init();
+	fsprops_init();
 }
 
 /*

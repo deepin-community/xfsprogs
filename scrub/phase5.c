@@ -1,21 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright (C) 2018 Oracle.  All Rights Reserved.
- * Author: Darrick J. Wong <darrick.wong@oracle.com>
+ * Copyright (C) 2018-2024 Oracle.  All Rights Reserved.
+ * Author: Darrick J. Wong <djwong@kernel.org>
  */
 #include "xfs.h"
 #include <stdint.h>
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/statvfs.h>
-#ifdef HAVE_LIBATTR
-# include <attr/attributes.h>
-#endif
 #include <linux/fs.h>
 #include "handle.h"
 #include "list.h"
 #include "libfrog/paths.h"
 #include "libfrog/workqueue.h"
+#include "libfrog/fsgeom.h"
+#include "libfrog/scrub.h"
+#include "libfrog/bitmap.h"
+#include "libfrog/bulkstat.h"
+#include "libfrog/fakelibattr.h"
 #include "xfs_scrub.h"
 #include "common.h"
 #include "inodes.h"
@@ -23,8 +25,39 @@
 #include "scrub.h"
 #include "descr.h"
 #include "unicrash.h"
+#include "repair.h"
 
-/* Phase 5: Check directory connectivity. */
+/* Phase 5: Full inode scans and check directory connectivity. */
+
+struct ncheck_state {
+	struct scrub_ctx	*ctx;
+
+	/* Have we aborted this scan? */
+	bool			aborted;
+
+	/* Is this the last time we're going to process deferred inodes? */
+	bool			last_call;
+
+	/* Did we fix at least one thing while walking @cur->deferred? */
+	bool			fixed_something;
+
+	/* Lock for this structure */
+	pthread_mutex_t		lock;
+
+	/*
+	 * Inodes that are involved with directory tree structure corruptions
+	 * are marked here.  This will be NULL until the first corruption is
+	 * noted.
+	 */
+	struct bitmap		*new_deferred;
+
+	/*
+	 * Inodes that we're reprocessing due to earlier directory tree
+	 * structure corruption problems are marked here.  This will be NULL
+	 * during the first (parallel) inode scan.
+	 */
+	struct bitmap		*cur_deferred;
+};
 
 /*
  * Warn about problematic bytes in a directory/attribute name.  That means
@@ -129,7 +162,6 @@ out_unicrash:
 	return ret;
 }
 
-#ifdef HAVE_LIBATTR
 /* Routines to scan all of an inode's xattrs for name problems. */
 struct attrns_decode {
 	int			flags;
@@ -138,8 +170,8 @@ struct attrns_decode {
 
 static const struct attrns_decode attr_ns[] = {
 	{0,			"user"},
-	{ATTR_ROOT,		"system"},
-	{ATTR_SECURE,		"secure"},
+	{XFS_IOC_ATTR_ROOT,	"system"},
+	{XFS_IOC_ATTR_SECURE,	"secure"},
 	{0, NULL},
 };
 
@@ -155,30 +187,41 @@ check_xattr_ns_names(
 	struct xfs_bulkstat		*bstat,
 	const struct attrns_decode	*attr_ns)
 {
-	struct attrlist_cursor		cur;
-	char				attrbuf[XFS_XATTR_LIST_MAX];
-	char				keybuf[XATTR_NAME_MAX + 1];
-	struct attrlist			*attrlist = (struct attrlist *)attrbuf;
-	struct attrlist_ent		*ent;
+	struct xfs_attrlist_cursor	cur = { };
+	char				*keybuf;
+	struct xfs_attrlist		*attrlist;
 	struct unicrash			*uc = NULL;
 	int				i;
 	int				error;
 
-	error = unicrash_xattr_init(&uc, ctx, bstat);
-	if (error) {
-		str_liberror(ctx, error, descr_render(dsc));
+	attrlist = calloc(XFS_XATTR_LIST_MAX, 1);
+	if (!attrlist) {
+		error = errno;
+		str_errno(ctx, descr_render(dsc));
 		return error;
 	}
 
-	memset(attrbuf, 0, XFS_XATTR_LIST_MAX);
-	memset(&cur, 0, sizeof(cur));
-	memset(keybuf, 0, XATTR_NAME_MAX + 1);
-	error = attr_list_by_handle(handle, sizeof(*handle), attrbuf,
-			XFS_XATTR_LIST_MAX, attr_ns->flags, &cur);
-	while (!error) {
+	keybuf = calloc(XATTR_NAME_MAX + 1, 1);
+	if (!keybuf) {
+		error = errno;
+		str_errno(ctx, descr_render(dsc));
+		goto out_attrlist;
+	}
+
+	error = unicrash_xattr_init(&uc, ctx, bstat);
+	if (error) {
+		str_liberror(ctx, error, descr_render(dsc));
+		goto out_keybuf;
+	}
+
+	while ((error = libfrog_attr_list_by_handle(handle, sizeof(*handle),
+				attrlist, XFS_XATTR_LIST_MAX, attr_ns->flags,
+				&cur)) == 0) {
 		/* Examine the xattrs. */
 		for (i = 0; i < attrlist->al_count; i++) {
-			ent = ATTR_ENTRY(attrlist, i);
+			struct xfs_attrlist_ent	*ent =
+					libfrog_attr_entry(attrlist, i);
+
 			snprintf(keybuf, XATTR_NAME_MAX, "%s.%s", attr_ns->name,
 					ent->a_name);
 			if (uc)
@@ -190,23 +233,26 @@ check_xattr_ns_names(
 						keybuf);
 			if (error) {
 				str_liberror(ctx, error, descr_render(dsc));
-				goto out;
+				goto out_uc;
 			}
 		}
 
 		if (!attrlist->al_more)
 			break;
-		error = attr_list_by_handle(handle, sizeof(*handle), attrbuf,
-				XFS_XATTR_LIST_MAX, attr_ns->flags, &cur);
 	}
 	if (error) {
 		if (errno == ESTALE)
 			errno = 0;
+		error = errno;
 		if (errno)
 			str_errno(ctx, descr_render(dsc));
 	}
-out:
+out_uc:
 	unicrash_free(uc);
+out_keybuf:
+	free(keybuf);
+out_attrlist:
+	free(attrlist);
 	return error;
 }
 
@@ -231,9 +277,6 @@ check_xattr_names(
 	}
 	return ret;
 }
-#else
-# define check_xattr_names(c, d, h, b)	(0)
-#endif /* HAVE_LIBATTR */
 
 static int
 render_ino_from_handle(
@@ -246,6 +289,81 @@ render_ino_from_handle(
 
 	return scrub_render_ino_descr(ctx, buf, buflen, bstat->bs_ino,
 			bstat->bs_gen, NULL);
+}
+
+/* Defer this inode until later. */
+static inline int
+defer_inode(
+	struct ncheck_state	*ncs,
+	uint64_t		ino)
+{
+	int			error;
+
+	pthread_mutex_lock(&ncs->lock);
+	if (!ncs->new_deferred) {
+		error = -bitmap_alloc(&ncs->new_deferred);
+		if (error)
+			goto unlock;
+	}
+	error = -bitmap_set(ncs->new_deferred, ino, 1);
+unlock:
+	pthread_mutex_unlock(&ncs->lock);
+	return error;
+}
+
+/*
+ * Check the directory structure for problems that could cause open_by_handle
+ * not to work.  Returns 0 for no problems; EADDRNOTAVAIL if the there are
+ * problems that would prevent name checking.
+ */
+static int
+check_dir_connection(
+	struct scrub_ctx		*ctx,
+	struct ncheck_state		*ncs,
+	const struct xfs_bulkstat	*bstat)
+{
+	struct scrub_item		sri = { };
+	int				error;
+
+	/* The dirtree scrubber only works when parent pointers are enabled */
+	if (!(ctx->mnt.fsgeom.flags & XFS_FSOP_GEOM_FLAGS_PARENT))
+		return 0;
+
+	scrub_item_init_file(&sri, bstat);
+	scrub_item_schedule(&sri, XFS_SCRUB_TYPE_DIRTREE);
+
+	error = scrub_item_check_file(ctx, &sri, -1);
+	if (error) {
+		str_liberror(ctx, error, _("checking directory loops"));
+		return error;
+	}
+
+	if (ncs->last_call)
+		error = repair_file_corruption_now(ctx, &sri, -1);
+	else
+		error = repair_file_corruption(ctx, &sri, -1);
+	if (error) {
+		str_liberror(ctx, error, _("repairing directory loops"));
+		return error;
+	}
+
+	/* No directory tree problems?  Clear this inode if it was deferred. */
+	if (repair_item_count_needsrepair(&sri) == 0) {
+		if (ncs->cur_deferred)
+			ncs->fixed_something = true;
+		return 0;
+	}
+
+	/* Don't defer anything during last call. */
+	if (ncs->last_call)
+		return 0;
+
+	/* Directory tree structure problems exist; do not check names yet. */
+	error = defer_inode(ncs, bstat->bs_ino);
+	if (error)
+		return error;
+
+	return EADDRNOTAVAIL;
 }
 
 /*
@@ -263,7 +381,7 @@ check_inode_names(
 	void			*arg)
 {
 	DEFINE_DESCR(dsc, ctx, render_ino_from_handle);
-	bool			*aborted = arg;
+	struct ncheck_state	*ncs = arg;
 	int			fd = -1;
 	int			error = 0;
 	int			err2;
@@ -271,11 +389,25 @@ check_inode_names(
 	descr_set(&dsc, bstat);
 	background_sleep();
 
+	/*
+	 * Try to fix directory loops before we have problems opening files by
+	 * handle.
+	 */
+	if (S_ISDIR(bstat->bs_mode)) {
+		error = check_dir_connection(ctx, ncs, bstat);
+		if (error == EADDRNOTAVAIL) {
+			error = 0;
+			goto out;
+		}
+		if (error)
+			goto err;
+	}
+
 	/* Warn about naming problems in xattrs. */
 	if (bstat->bs_xflags & FS_XFLAG_HASATTR) {
 		error = check_xattr_names(ctx, &dsc, handle, bstat);
 		if (error)
-			goto out;
+			goto err;
 	}
 
 	/*
@@ -291,16 +423,16 @@ check_inode_names(
 			if (error == ESTALE)
 				return ESTALE;
 			str_errno(ctx, descr_render(&dsc));
-			goto out;
+			goto err;
 		}
 
 		error = check_dirent_names(ctx, &dsc, &fd, bstat);
 		if (error)
-			goto out;
+			goto err_fd;
 	}
 
-out:
 	progress_add(1);
+err_fd:
 	if (fd >= 0) {
 		err2 = close(fd);
 		if (err2)
@@ -308,13 +440,120 @@ out:
 		if (!error && err2)
 			error = err2;
 	}
-
+err:
 	if (error)
-		*aborted = true;
-	if (!error && *aborted)
+		ncs->aborted = true;
+out:
+	if (!error && ncs->aborted)
 		error = ECANCELED;
 
 	return error;
+}
+
+/* Try to check_inode_names on a specific inode. */
+static int
+retry_deferred_inode(
+	struct ncheck_state	*ncs,
+	struct xfs_handle	*handle,
+	uint64_t		ino)
+{
+	struct xfs_bulkstat	bstat;
+	struct scrub_ctx	*ctx = ncs->ctx;
+	unsigned int		flags = 0;
+	int			error;
+
+	error = -xfrog_bulkstat_single(&ctx->mnt, ino, flags, &bstat);
+	if (error == ENOENT) {
+		/* Directory is gone, mark it clear. */
+		ncs->fixed_something = true;
+		return 0;
+	}
+	if (error)
+		return error;
+
+	handle->ha_fid.fid_ino = bstat.bs_ino;
+	handle->ha_fid.fid_gen = bstat.bs_gen;
+
+	return check_inode_names(ncs->ctx, handle, &bstat, ncs);
+}
+
+/* Try to check_inode_names on a range of inodes from the bitmap. */
+static int
+retry_deferred_inode_range(
+	uint64_t		ino,
+	uint64_t		len,
+	void			*arg)
+{
+	struct xfs_handle	handle = { };
+	struct ncheck_state	*ncs = arg;
+	struct scrub_ctx	*ctx = ncs->ctx;
+	uint64_t		i;
+	int			error;
+
+	memcpy(&handle.ha_fsid, ctx->fshandle, sizeof(handle.ha_fsid));
+	handle.ha_fid.fid_len = sizeof(xfs_fid_t) -
+			sizeof(handle.ha_fid.fid_len);
+	handle.ha_fid.fid_pad = 0;
+
+	for (i = 0; i < len; i++) {
+		error = retry_deferred_inode(ncs, &handle, ino + i);
+		if (error)
+			return error;
+	}
+
+	return 0;
+}
+
+/*
+ * Try to check_inode_names on inodes that were deferred due to directory tree
+ * problems until we stop making progress.
+ */
+static int
+retry_deferred_inodes(
+	struct scrub_ctx	*ctx,
+	struct ncheck_state	*ncs)
+{
+	int			error;
+
+	if  (!ncs->new_deferred)
+		return 0;
+
+	/*
+	 * Try to repair things until we stop making forward progress or we
+	 * don't observe any new corruptions.  During the loop, we do not
+	 * complain about the corruptions that do not get fixed.
+	 */
+	do {
+		ncs->cur_deferred = ncs->new_deferred;
+		ncs->new_deferred = NULL;
+		ncs->fixed_something = false;
+
+		error = -bitmap_iterate(ncs->cur_deferred,
+				retry_deferred_inode_range, ncs);
+		if (error)
+			return error;
+
+		bitmap_free(&ncs->cur_deferred);
+	} while (ncs->fixed_something && ncs->new_deferred);
+
+	/*
+	 * Try one last time to fix things, and complain about any problems
+	 * that remain.
+	 */
+	if (!ncs->new_deferred)
+		return 0;
+
+	ncs->cur_deferred = ncs->new_deferred;
+	ncs->new_deferred = NULL;
+	ncs->last_call = true;
+
+	error = -bitmap_iterate(ncs->cur_deferred,
+			retry_deferred_inode_range, ncs);
+	if (error)
+		return error;
+
+	bitmap_free(&ncs->cur_deferred);
+	return 0;
 }
 
 #ifndef FS_IOC_GETFSLABEL
@@ -380,13 +619,146 @@ out:
 	return error;
 }
 
+struct fs_scan_item {
+	struct scrub_item	sri;
+	bool			*abortedp;
+};
+
+/* Run one full-fs scan scrubber in this thread. */
+static void
+fs_scan_worker(
+	struct workqueue	*wq,
+	xfs_agnumber_t		nr,
+	void			*arg)
+{
+	struct timespec		tv;
+	struct fs_scan_item	*item = arg;
+	struct scrub_ctx	*ctx = wq->wq_ctx;
+	int			ret;
+
+	/*
+	 * Delay each successive fs scan by a second so that the threads are
+	 * less likely to contend on the inobt and inode buffers.
+	 */
+	if (nr) {
+		tv.tv_sec = nr;
+		tv.tv_nsec = 0;
+		nanosleep(&tv, NULL);
+	}
+
+	ret = scrub_item_check(ctx, &item->sri);
+	if (ret) {
+		str_liberror(ctx, ret, _("checking fs scan metadata"));
+		*item->abortedp = true;
+		goto out;
+	}
+
+	ret = repair_item_completely(ctx, &item->sri);
+	if (ret) {
+		str_liberror(ctx, ret, _("repairing fs scan metadata"));
+		*item->abortedp = true;
+		goto out;
+	}
+
+out:
+	free(item);
+	return;
+}
+
+/* Queue one full-fs scan scrubber. */
+static int
+queue_fs_scan(
+	struct workqueue	*wq,
+	bool			*abortedp,
+	xfs_agnumber_t		nr,
+	unsigned int		scrub_type)
+{
+	struct fs_scan_item	*item;
+	struct scrub_ctx	*ctx = wq->wq_ctx;
+	int			ret;
+
+	item = malloc(sizeof(struct fs_scan_item));
+	if (!item) {
+		ret = ENOMEM;
+		str_liberror(ctx, ret, _("setting up fs scan"));
+		return ret;
+	}
+	scrub_item_init_fs(&item->sri);
+	scrub_item_schedule(&item->sri, scrub_type);
+	item->abortedp = abortedp;
+
+	ret = -workqueue_add(wq, fs_scan_worker, nr, item);
+	if (ret)
+		str_liberror(ctx, ret, _("queuing fs scan work"));
+
+	return ret;
+}
+
+/* Run multiple full-fs scan scrubbers at the same time. */
+static int
+run_kernel_fs_scan_scrubbers(
+	struct scrub_ctx	*ctx)
+{
+	struct workqueue	wq_fs_scan;
+	unsigned int		nr_threads = scrub_nproc_workqueue(ctx);
+	xfs_agnumber_t		nr = 0;
+	bool			aborted = false;
+	int			ret, ret2;
+
+	ret = -workqueue_create(&wq_fs_scan, (struct xfs_mount *)ctx,
+			nr_threads);
+	if (ret) {
+		str_liberror(ctx, ret, _("setting up fs scan workqueue"));
+		return ret;
+	}
+
+	/*
+	 * The nlinks scanner is much faster than quotacheck because it only
+	 * walks directories, so we start it first.
+	 */
+	ret = queue_fs_scan(&wq_fs_scan, &aborted, nr, XFS_SCRUB_TYPE_NLINKS);
+	if (ret)
+		goto wait;
+
+	if (nr_threads > 1)
+		nr++;
+
+	ret = queue_fs_scan(&wq_fs_scan, &aborted, nr,
+			XFS_SCRUB_TYPE_QUOTACHECK);
+	if (ret)
+		goto wait;
+
+wait:
+	ret2 = -workqueue_terminate(&wq_fs_scan);
+	if (ret2) {
+		str_liberror(ctx, ret2, _("joining fs scan workqueue"));
+		if (!ret)
+			ret = ret2;
+	}
+	if (aborted && !ret)
+		ret = ECANCELED;
+
+	workqueue_destroy(&wq_fs_scan);
+	return ret;
+}
+
 /* Check directory connectivity. */
 int
 phase5_func(
 	struct scrub_ctx	*ctx)
 {
-	bool			aborted = false;
+	struct ncheck_state	ncs = { .ctx = ctx };
 	int			ret;
+
+
+	/*
+	 * Check and fix anything that requires a full filesystem scan.  We do
+	 * this after we've checked all inodes and repaired anything that could
+	 * get in the way of a scan.
+	 */
+	ret = run_kernel_fs_scan_scrubbers(ctx);
+	if (ret)
+		return ret;
 
 	if (ctx->corruptions_found || ctx->unfixable_errors) {
 		str_info(ctx, ctx->mntpoint,
@@ -398,14 +770,28 @@ _("Filesystem has errors, skipping connectivity checks."));
 	if (ret)
 		return ret;
 
-	ret = scrub_scan_all_inodes(ctx, check_inode_names, &aborted);
+	pthread_mutex_init(&ncs.lock, NULL);
+
+	ret = scrub_scan_all_inodes(ctx, check_inode_names, &ncs);
 	if (ret)
-		return ret;
-	if (aborted)
-		return ECANCELED;
+		goto out_lock;
+	if (ncs.aborted) {
+		ret = ECANCELED;
+		goto out_lock;
+	}
+
+	ret = retry_deferred_inodes(ctx, &ncs);
+	if (ret)
+		goto out_lock;
 
 	scrub_report_preen_triggers(ctx);
-	return 0;
+out_lock:
+	pthread_mutex_destroy(&ncs.lock);
+	if (ncs.new_deferred)
+		bitmap_free(&ncs.new_deferred);
+	if (ncs.cur_deferred)
+		bitmap_free(&ncs.cur_deferred);
+	return ret;
 }
 
 /* Estimate how much work we're going to do. */
@@ -416,8 +802,8 @@ phase5_estimate(
 	unsigned int		*nr_threads,
 	int			*rshift)
 {
-	*items = ctx->mnt_sv.f_files - ctx->mnt_sv.f_ffree;
-	*nr_threads = scrub_nproc(ctx);
+	*items = scrub_estimate_iscan_work(ctx);
+	*nr_threads = scrub_nproc(ctx) * 2;
 	*rshift = 0;
 	return 0;
 }

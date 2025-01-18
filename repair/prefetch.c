@@ -328,13 +328,13 @@ pf_scanfunc_bmap(
 		if (numrecs > mp->m_bmap_dmxr[0] || !isadir)
 			return 0;
 		return pf_read_bmbt_reclist(args,
-			XFS_BMBT_REC_ADDR(mp, block, 1), numrecs);
+			xfs_bmbt_rec_addr(mp, block, 1), numrecs);
 	}
 
 	if (numrecs > mp->m_bmap_dmxr[1])
 		return 0;
 
-	pp = XFS_BMBT_PTR_ADDR(mp, block, 1, mp->m_bmap_dmxr[1]);
+	pp = xfs_bmbt_ptr_addr(mp, block, 1, mp->m_bmap_dmxr[1]);
 
 	for (i = 0; i < numrecs; i++) {
 		dbno = get_unaligned_be64(&pp[i]);
@@ -372,11 +372,11 @@ pf_read_btinode(
 	/*
 	 * use bmdr/dfork_dsize since the root block is in the data fork
 	 */
-	if (XFS_BMDR_SPACE_CALC(numrecs) > XFS_DFORK_DSIZE(dino, mp))
+	if (xfs_bmdr_space_calc(numrecs) > XFS_DFORK_DSIZE(dino, mp))
 		return;
 
 	dsize = XFS_DFORK_DSIZE(dino, mp);
-	pp = XFS_BMDR_PTR_ADDR(dib, 1, libxfs_bmdr_maxrecs(dsize, 0));
+	pp = xfs_bmdr_ptr_addr(dib, 1, libxfs_bmdr_maxrecs(dsize, 0));
 
 	for (i = 0; i < numrecs; i++) {
 		dbno = get_unaligned_be64(&pp[i]);
@@ -393,7 +393,7 @@ pf_read_exinode(
 	struct xfs_dinode	*dino)
 {
 	pf_read_bmbt_reclist(args, (xfs_bmbt_rec_t *)XFS_DFORK_DPTR(dino),
-			be32_to_cpu(dino->di_nextents));
+			xfs_dfork_data_extents(dino));
 }
 
 static void
@@ -475,7 +475,7 @@ pf_batch_read(
 {
 	struct xfs_buf		*bplist[MAX_BUFS];
 	unsigned int		num;
-	off64_t			first_off, last_off, next_off;
+	off_t			first_off, last_off, next_off;
 	int			len, size;
 	int			i;
 	int			inode_bufs;
@@ -494,7 +494,7 @@ pf_batch_read(
 						args->last_bno_read, &fsbno);
 			max_fsbno = fsbno + pf_max_fsbs;
 		}
-		while (bplist[num] && num < MAX_BUFS && fsbno < max_fsbno) {
+		while (num < MAX_BUFS && bplist[num] && fsbno < max_fsbno) {
 			/*
 			 * Discontiguous buffers need special handling, so stop
 			 * gathering new buffers and process the list and this
@@ -764,6 +764,8 @@ pf_queuing_worker(
 			irec = next_ino_rec(irec);
 			num_inos += XFS_INODES_PER_CHUNK;
 		}
+		if (!irec)
+			break;
 
 		if (args->dirs_only && cur_irec->ino_isa_dir == 0)
 			continue;
@@ -876,7 +878,7 @@ init_prefetch(
 	xfs_mount_t		*pmp)
 {
 	mp = pmp;
-	mp_fd = libxfs_device_to_fd(mp->m_ddev_targp->bt_bdev);
+	mp_fd = mp->m_ddev_targp->bt_bdev_fd;;
 	pf_max_bytes = sysconf(_SC_PAGE_SIZE) << 7;
 	pf_max_bbs = pf_max_bytes >> BBSHIFT;
 	pf_max_fsbs = pf_max_bytes >> mp->m_sb.sb_blocklog;
@@ -886,10 +888,12 @@ init_prefetch(
 
 prefetch_args_t *
 start_inode_prefetch(
+	struct xfs_mount	*mp,
 	xfs_agnumber_t		agno,
 	int			dirs_only,
 	prefetch_args_t		*prev_args)
 {
+	struct cache		*bcache = mp->m_ddev_targp->bcache;
 	prefetch_args_t		*args;
 	long			max_queue;
 	struct xfs_ino_geometry	*igeo = M_IGEO(mp);
@@ -914,7 +918,7 @@ start_inode_prefetch(
 	 * and not any other associated metadata like directories
 	 */
 
-	max_queue = libxfs_bcache->c_maxcount / thread_count / 8;
+	max_queue = bcache->c_maxcount / thread_count / 8;
 	if (igeo->inode_cluster_size > mp->m_sb.sb_blocksize)
 		max_queue = max_queue * igeo->blocks_per_cluster /
 				igeo->ialloc_blks;
@@ -970,14 +974,16 @@ prefetch_ag_range(
 	void			(*func)(struct workqueue *,
 					xfs_agnumber_t, void *))
 {
+	struct xfs_mount	*mp = work->wq_ctx;
 	int			i;
 	struct prefetch_args	*pf_args[2];
 
-	pf_args[start_ag & 1] = start_inode_prefetch(start_ag, dirs_only, NULL);
+	pf_args[start_ag & 1] = start_inode_prefetch(mp, start_ag, dirs_only,
+			NULL);
 	for (i = start_ag; i < end_ag; i++) {
 		/* Don't prefetch end_ag */
 		if (i + 1 < end_ag)
-			pf_args[(~i) & 1] = start_inode_prefetch(i + 1,
+			pf_args[(~i) & 1] = start_inode_prefetch(mp, i + 1,
 						dirs_only, pf_args[i & 1]);
 		func(work, i, pf_args[i & 1]);
 	}
@@ -1027,7 +1033,7 @@ do_inode_prefetch(
 	 * filesystem - it's all in the cache. In that case, run a thread per
 	 * CPU to maximise parallelism of the queue to be processed.
 	 */
-	if (check_cache && !libxfs_bcache_overflowed()) {
+	if (check_cache && !libxfs_bcache_overflowed(mp)) {
 		queue.wq_ctx = mp;
 		create_work_queue(&queue, mp, platform_nproc());
 		for (i = 0; i < mp->m_sb.sb_agcount; i++)

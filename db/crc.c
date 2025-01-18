@@ -98,7 +98,7 @@ crc_f(
 	}
 
 	if ((invalidate || recalculate) &&
-	    ((x.isreadonly & LIBXFS_ISREADONLY) || !expert_mode)) {
+	    ((x.flags & LIBXFS_ISREADONLY) || !expert_mode)) {
 		dbprintf(_("%s not in expert mode, writing disabled\n"),
 			progname);
 		return 0;
@@ -114,7 +114,7 @@ crc_f(
 	}
 
 	/* Search for a CRC field */
-	fl = flist_find_ftyp(fields, FLDT_CRC);
+	fl = flist_find_ftyp(fields, FLDT_CRC, iocur_top->data, 0);
 	if (!fl) {
 		dbprintf(_("No CRC field found for type %s\n"), cur_typ->name);
 		return 0;
