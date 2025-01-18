@@ -41,18 +41,18 @@
 /* and cannot be larger than 128M */
 #define MAX_SLAB_SIZE		(128 * 1048576)
 struct xfs_slab_hdr {
-	size_t			sh_nr;
-	size_t			sh_inuse;	/* items in use */
+	uint32_t		sh_nr;
+	uint32_t		sh_inuse;	/* items in use */
 	struct xfs_slab_hdr	*sh_next;	/* next slab hdr */
 						/* objects follow */
 };
 
 struct xfs_slab {
-	size_t			s_item_sz;	/* item size */
-	size_t			s_nr_slabs;	/* # of slabs */
-	size_t			s_nr_items;	/* # of items */
+	uint64_t		s_nr_slabs;	/* # of slabs */
+	uint64_t		s_nr_items;	/* # of items */
 	struct xfs_slab_hdr	*s_first;	/* first slab header */
 	struct xfs_slab_hdr	*s_last;	/* last sh_next pointer */
+	size_t			s_item_sz;	/* item size */
 };
 
 /*
@@ -64,30 +64,18 @@ struct xfs_slab {
  */
 struct xfs_slab_hdr_cursor {
 	struct xfs_slab_hdr	*hdr;		/* a slab header */
-	size_t			loc;		/* where we are in the slab */
+	uint32_t		loc;		/* where we are in the slab */
 };
 
 typedef int (*xfs_slab_compare_fn)(const void *, const void *);
 
 struct xfs_slab_cursor {
-	size_t				nr;		/* # of per-slab cursors */
+	uint64_t			nr;		/* # of per-slab cursors */
 	struct xfs_slab			*slab;		/* pointer to the slab */
 	struct xfs_slab_hdr_cursor	*last_hcur;	/* last header we took from */
 	xfs_slab_compare_fn		compare_fn;	/* compare items */
 	struct xfs_slab_hdr_cursor	hcur[0];	/* per-slab cursors */
 };
-
-/*
- * Bags -- each bag is an array of pointers items; when a bag fills up, we
- * resize it.
- */
-#define MIN_BAG_SIZE	4096
-struct xfs_bag {
-	size_t			bg_nr;		/* number of pointers */
-	size_t			bg_inuse;	/* number of slots in use */
-	void			**bg_ptrs;	/* pointers */
-};
-#define BAG_END(bag)	(&(bag)->bg_ptrs[(bag)->bg_nr])
 
 /*
  * Create a slab to hold some objects of a particular size.
@@ -137,7 +125,7 @@ static void *
 slab_ptr(
 	struct xfs_slab		*slab,
 	struct xfs_slab_hdr	*hdr,
-	size_t			idx)
+	uint32_t		idx)
 {
 	char			*p;
 
@@ -155,12 +143,12 @@ slab_add(
 	struct xfs_slab		*slab,
 	void			*item)
 {
-	struct xfs_slab_hdr		*hdr;
+	struct xfs_slab_hdr	*hdr;
 	void			*p;
 
 	hdr = slab->s_last;
 	if (!hdr || hdr->sh_inuse == hdr->sh_nr) {
-		size_t n;
+		uint32_t	n;
 
 		n = (hdr ? hdr->sh_nr * 2 : MIN_SLAB_NR);
 		if (n * slab->s_item_sz > MAX_SLAB_SIZE)
@@ -308,7 +296,7 @@ peek_slab_cursor(
 	struct xfs_slab_hdr_cursor	*hcur;
 	void			*p = NULL;
 	void			*q;
-	size_t			i;
+	uint64_t		i;
 
 	cur->last_hcur = NULL;
 
@@ -370,114 +358,9 @@ pop_slab_cursor(
 /*
  * Return the number of items in the slab.
  */
-size_t
+uint64_t
 slab_count(
 	struct xfs_slab	*slab)
 {
 	return slab->s_nr_items;
-}
-
-/*
- * Create a bag to point to some objects.
- */
-int
-init_bag(
-	struct xfs_bag	**bag)
-{
-	struct xfs_bag	*ptr;
-
-	ptr = calloc(1, sizeof(struct xfs_bag));
-	if (!ptr)
-		return -ENOMEM;
-	ptr->bg_ptrs = calloc(MIN_BAG_SIZE, sizeof(void *));
-	if (!ptr->bg_ptrs) {
-		free(ptr);
-		return -ENOMEM;
-	}
-	ptr->bg_nr = MIN_BAG_SIZE;
-	*bag = ptr;
-	return 0;
-}
-
-/*
- * Free a bag of pointers.
- */
-void
-free_bag(
-	struct xfs_bag	**bag)
-{
-	struct xfs_bag	*ptr;
-
-	ptr = *bag;
-	if (!ptr)
-		return;
-	free(ptr->bg_ptrs);
-	free(ptr);
-	*bag = NULL;
-}
-
-/*
- * Add an object to the pointer bag.
- */
-int
-bag_add(
-	struct xfs_bag	*bag,
-	void		*ptr)
-{
-	void		**p, **x;
-
-	p = &bag->bg_ptrs[bag->bg_inuse];
-	if (p == BAG_END(bag)) {
-		/* No free space, alloc more pointers */
-		size_t nr;
-
-		nr = bag->bg_nr * 2;
-		x = realloc(bag->bg_ptrs, nr * sizeof(void *));
-		if (!x)
-			return -ENOMEM;
-		bag->bg_ptrs = x;
-		memset(BAG_END(bag), 0, bag->bg_nr * sizeof(void *));
-		bag->bg_nr = nr;
-	}
-	bag->bg_ptrs[bag->bg_inuse] = ptr;
-	bag->bg_inuse++;
-	return 0;
-}
-
-/*
- * Remove a pointer from a bag.
- */
-int
-bag_remove(
-	struct xfs_bag	*bag,
-	size_t		nr)
-{
-	ASSERT(nr < bag->bg_inuse);
-	memmove(&bag->bg_ptrs[nr], &bag->bg_ptrs[nr + 1],
-		(bag->bg_inuse - nr - 1) * sizeof(void *));
-	bag->bg_inuse--;
-	return 0;
-}
-
-/*
- * Return the number of items in a bag.
- */
-size_t
-bag_count(
-	struct xfs_bag	*bag)
-{
-	return bag->bg_inuse;
-}
-
-/*
- * Return the nth item in a bag.
- */
-void *
-bag_item(
-	struct xfs_bag	*bag,
-	size_t		nr)
-{
-	if (nr >= bag->bg_inuse)
-		return NULL;
-	return bag->bg_ptrs[nr];
 }

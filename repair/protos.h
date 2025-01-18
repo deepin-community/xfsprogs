@@ -4,7 +4,7 @@
  * All Rights Reserved.
  */
 
-void	xfs_init(libxfs_init_t *args);
+void	xfs_init(struct libxfs_init *args);
 
 int	verify_sb(char			*sb_buf,
 		xfs_sb_t		*sb,
@@ -16,6 +16,7 @@ int	get_sb(xfs_sb_t			*sbp,
 		xfs_off_t			off,
 		int			size,
 		xfs_agnumber_t		agno);
+int retain_primary_sb(struct xfs_mount *mp);
 void	write_primary_sb(xfs_sb_t	*sbp,
 			int		size);
 
@@ -36,6 +37,7 @@ void	phase1(struct xfs_mount *);
 void	phase2(struct xfs_mount *, int);
 void	phase3(struct xfs_mount *, int);
 void	phase4(struct xfs_mount *);
+void	check_rtmetadata(struct xfs_mount *mp);
 void	phase5(struct xfs_mount *);
 void	phase6(struct xfs_mount *);
 void	phase7(struct xfs_mount *, int);

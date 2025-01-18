@@ -6,6 +6,10 @@
  * Portions of statx support written by David Howells (dhowells@redhat.com)
  */
 
+#ifdef OVERRIDE_SYSTEM_STATX
+#define statx sys_statx
+#endif
+
 #include "command.h"
 #include "input.h"
 #include "init.h"
@@ -21,7 +25,7 @@ static cmdinfo_t stat_cmd;
 static cmdinfo_t statfs_cmd;
 static cmdinfo_t statx_cmd;
 
-off64_t
+off_t
 filesize(void)
 {
 	struct stat	st;
@@ -66,11 +70,11 @@ dump_raw_stat(struct stat *st)
 	printf("stat.ino = %llu\n", (unsigned long long)st->st_ino);
 	printf("stat.size = %lld\n", (long long)st->st_size);
 	printf("stat.blocks = %lld\n", (long long)st->st_blocks);
-	printf("stat.atime.tv_sec = %ld\n", st->st_atim.tv_sec);
+	printf("stat.atime.tv_sec = %jd\n", (intmax_t)st->st_atim.tv_sec);
 	printf("stat.atime.tv_nsec = %ld\n", st->st_atim.tv_nsec);
-	printf("stat.ctime.tv_sec = %ld\n", st->st_ctim.tv_sec);
+	printf("stat.ctime.tv_sec = %jd\n", (intmax_t)st->st_ctim.tv_sec);
 	printf("stat.ctime.tv_nsec = %ld\n", st->st_ctim.tv_nsec);
-	printf("stat.mtime.tv_sec = %ld\n", st->st_mtim.tv_sec);
+	printf("stat.mtime.tv_sec = %jd\n", (intmax_t)st->st_mtim.tv_sec);
 	printf("stat.mtime.tv_nsec = %ld\n", st->st_mtim.tv_nsec);
 	printf("stat.rdev_major = %u\n", major(st->st_rdev));
 	printf("stat.rdev_minor = %u\n", minor(st->st_rdev));
@@ -238,10 +242,8 @@ statfs_f(
 					(long long) st.f_files);
 			printf(_("statfs.f_ffree = %lld\n"),
 					(long long) st.f_ffree);
-#ifdef HAVE_STATFS_FLAGS
 			printf(_("statfs.f_flags = 0x%llx\n"),
 					(long long) st.f_flags);
-#endif
 		}
 	}
 
@@ -349,6 +351,9 @@ dump_raw_statx(struct statx *stx)
 	printf("stat.rdev_minor = %u\n", stx->stx_rdev_minor);
 	printf("stat.dev_major = %u\n", stx->stx_dev_major);
 	printf("stat.dev_minor = %u\n", stx->stx_dev_minor);
+	printf("stat.atomic_write_unit_min = %u\n", stx->stx_atomic_write_unit_min);
+	printf("stat.atomic_write_unit_max = %u\n", stx->stx_atomic_write_unit_max);
+	printf("stat.atomic_write_segments_max = %u\n", stx->stx_atomic_write_segments_max);
 	return 0;
 }
 

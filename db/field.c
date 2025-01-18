@@ -24,9 +24,15 @@
 #include "dir2sf.h"
 #include "symlink.h"
 
+#define	PPOFF(f)	bitize(offsetof(struct xfs_parent_rec, f))
+const field_t		parent_flds[] = {
+	{ "inumber", FLDT_INO, OI(PPOFF(p_ino)), C1, 0, TYP_INODE },
+	{ "gen", FLDT_UINT32D, OI(PPOFF(p_gen)), C1, 0, TYP_NONE },
+	{ NULL }
+};
+#undef PPOFF
+
 const ftattr_t	ftattrtab[] = {
-	{ FLDT_AEXTNUM, "aextnum", fp_num, "%d", SI(bitsz(xfs_aextnum_t)),
-	  FTARG_SIGNED, NULL, NULL },
 	{ FLDT_AGBLOCK, "agblock", fp_num, "%u", SI(bitsz(xfs_agblock_t)),
 	  FTARG_DONULL, fa_agblock, NULL },
 	{ FLDT_AGBLOCKNZ, "agblocknz", fp_num, "%u", SI(bitsz(xfs_agblock_t)),
@@ -300,8 +306,6 @@ const ftattr_t	ftattrtab[] = {
 	  FTARG_DONULL, fa_drtbno, NULL },
 	{ FLDT_EXTLEN, "extlen", fp_num, "%u", SI(bitsz(xfs_extlen_t)), 0, NULL,
 	  NULL },
-	{ FLDT_EXTNUM, "extnum", fp_num, "%d", SI(bitsz(xfs_extnum_t)),
-	  FTARG_SIGNED, NULL, NULL },
 	{ FLDT_FSIZE, "fsize", fp_num, "%lld", SI(bitsz(xfs_fsize_t)),
 	  FTARG_SIGNED, NULL, NULL },
 	{ FLDT_INO, "ino", fp_num, "%llu", SI(bitsz(xfs_ino_t)), FTARG_DONULL,
@@ -312,9 +316,17 @@ const ftattr_t	ftattrtab[] = {
 	  FTARG_SIZE, NULL, inobt_crc_flds },
 	{ FLDT_INOBT_SPCRC, "inobt",  NULL, (char *)inobt_spcrc_flds,
 	  btblock_size, FTARG_SIZE, NULL, inobt_spcrc_flds },
+	{ FLDT_FINOBT, "finobt",  NULL, (char *)finobt_flds, btblock_size,
+	  FTARG_SIZE, NULL, finobt_flds },
+	{ FLDT_FINOBT_CRC, "finobt",  NULL, (char *)finobt_crc_flds, btblock_size,
+	  FTARG_SIZE, NULL, finobt_crc_flds },
+	{ FLDT_FINOBT_SPCRC, "finobt",  NULL, (char *)finobt_spcrc_flds,
+	  btblock_size, FTARG_SIZE, NULL, finobt_spcrc_flds },
 	{ FLDT_INOBTKEY, "inobtkey", fp_sarray, (char *)inobt_key_flds,
 	  SI(bitsz(xfs_inobt_key_t)), 0, NULL, inobt_key_flds },
 	{ FLDT_INOBTPTR, "inobtptr", fp_num, "%u", SI(bitsz(xfs_inobt_ptr_t)),
+	  0, fa_agblock, NULL },
+	{ FLDT_FINOBTPTR, "finobtptr", fp_num, "%u", SI(bitsz(xfs_inobt_ptr_t)),
 	  0, fa_agblock, NULL },
 	{ FLDT_INOBTREC, "inobtrec", fp_sarray, (char *)inobt_rec_flds,
 	  SI(bitsz(xfs_inobt_rec_t)), 0, NULL, inobt_rec_flds },
@@ -338,7 +350,8 @@ const ftattr_t	ftattrtab[] = {
 	  FTARG_SIGNED, NULL, NULL },
 	{ FLDT_QCNT, "qcnt", fp_num, "%llu", SI(bitsz(xfs_qcnt_t)), 0, NULL,
 	  NULL },
-	{ FLDT_QWARNCNT, "qwarncnt", fp_num, "%u", SI(bitsz(xfs_qwarncnt_t)), 0,
+	/* warning counter field removed */
+	{ FLDT_QWARNCNT, "qwarncnt", fp_num, "%u", SI(bitsz(uint16_t)), 0,
 	  NULL, NULL },
 	{ FLDT_SB, "sb", NULL, (char *)sb_flds, sb_size, FTARG_SIZE, NULL,
 	  sb_flds },
@@ -379,6 +392,8 @@ const ftattr_t	ftattrtab[] = {
 	{ FLDT_UINT8X, "uint8x", fp_num, "%#x", SI(bitsz(uint8_t)), 0, NULL,
 	  NULL },
 	{ FLDT_UUID, "uuid", fp_uuid, NULL, SI(bitsz(uuid_t)), 0, NULL, NULL },
+	{ FLDT_PARENT_REC, "parent", NULL, (char *)parent_flds,
+	  SI(bitsz(struct xfs_parent_rec)), 0, NULL, parent_flds },
 	{ FLDT_ZZZ, NULL }
 };
 

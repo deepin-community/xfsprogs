@@ -125,13 +125,11 @@ __find_secondary_sb(
 		/*
 		 * read disk 1 MByte at a time.
 		 */
-		if (lseek(x.dfd, off, SEEK_SET) != off)  {
+		if (lseek(x.data.fd, off, SEEK_SET) != off)
 			done = 1;
-		}
 
-		if (!done && (bsize = read(x.dfd, sb, BSIZE)) <= 0)  {
+		if (!done && (bsize = read(x.data.fd, sb, BSIZE)) <= 0)
 			done = 1;
-		}
 
 		do_warn(".");
 
@@ -176,7 +174,7 @@ static int
 guess_default_geometry(
 	uint64_t		*agsize,
 	uint64_t		*agcount,
-	libxfs_init_t		*x)
+	struct libxfs_init	*x)
 {
 	struct fs_topology	ft;
 	int			blocklog;
@@ -191,8 +189,8 @@ guess_default_geometry(
 	 * Use default block size (2^12)
 	 */
 	blocklog = 12;
-	multidisk = ft.dswidth | ft.dsunit;
-	dblocks = x->dsize >> (blocklog - BBSHIFT);
+	multidisk = ft.data.swidth | ft.data.sunit;
+	dblocks = x->data.size >> (blocklog - BBSHIFT);
 	calc_default_ag_geometry(blocklog, dblocks, multidisk,
 				 agsize, agcount);
 
@@ -449,42 +447,8 @@ verify_sb(char *sb_buf, xfs_sb_t *sb, int is_primary_sb)
 			return(XR_BAD_SECT_SIZE_DATA);
 	}
 
-	/*
-	 * real-time extent size is always set
-	 */
-	if (sb->sb_rextsize * sb->sb_blocksize > XFS_MAX_RTEXTSIZE)
-		return(XR_BAD_RT_GEO_DATA);
-
-	if (sb->sb_rextsize * sb->sb_blocksize < XFS_MIN_RTEXTSIZE)
-			return(XR_BAD_RT_GEO_DATA);
-
-	if (sb->sb_rblocks == 0)  {
-		if (sb->sb_rextents != 0)
-			return(XR_BAD_RT_GEO_DATA);
-
-		if (sb->sb_rbmblocks != 0)
-			return(XR_BAD_RT_GEO_DATA);
-
-		if (sb->sb_rextslog != 0)
-			return(XR_BAD_RT_GEO_DATA);
-
-		if (sb->sb_frextents != 0)
-			return(XR_BAD_RT_GEO_DATA);
-	} else  {
-		/*
-		 * if we have a real-time partition, sanity-check geometry
-		 */
-		if (sb->sb_rblocks / sb->sb_rextsize != sb->sb_rextents)
-			return(XR_BAD_RT_GEO_DATA);
-
-		if (sb->sb_rextslog !=
-				libxfs_highbit32((unsigned int)sb->sb_rextents))
-			return(XR_BAD_RT_GEO_DATA);
-
-		if (sb->sb_rbmblocks != (xfs_extlen_t) howmany(sb->sb_rextents,
-						NBBY * sb->sb_blocksize))
-			return(XR_BAD_RT_GEO_DATA);
-	}
+	if (!libxfs_validate_rt_geometry(sb))
+		return XR_BAD_RT_GEO_DATA;
 
 	/*
 	 * verify correctness of inode alignment if it's there
@@ -533,7 +497,7 @@ write_primary_sb(xfs_sb_t *sbp, int size)
 	}
 	memset(buf, 0, size);
 
-	if (lseek(x.dfd, 0LL, SEEK_SET) != 0LL) {
+	if (lseek(x.data.fd, 0LL, SEEK_SET) != 0LL) {
 		free(buf);
 		do_error(_("couldn't seek to offset 0 in filesystem\n"));
 	}
@@ -543,7 +507,7 @@ write_primary_sb(xfs_sb_t *sbp, int size)
 	if (xfs_sb_version_hascrc(sbp))
 		xfs_update_cksum((char *)buf, size, XFS_SB_CRC_OFF);
 
-	if (write(x.dfd, buf, size) != size) {
+	if (write(x.data.fd, buf, size) != size) {
 		free(buf);
 		do_error(_("primary superblock write failed!\n"));
 	}
@@ -572,7 +536,7 @@ get_sb(xfs_sb_t *sbp, xfs_off_t off, int size, xfs_agnumber_t agno)
 
 	/* try and read it first */
 
-	if (lseek(x.dfd, off, SEEK_SET) != off)  {
+	if (lseek(x.data.fd, off, SEEK_SET) != off)  {
 		do_warn(
 	_("error reading superblock %u -- seek to offset %" PRId64 " failed\n"),
 			agno, off);
@@ -580,7 +544,7 @@ get_sb(xfs_sb_t *sbp, xfs_off_t off, int size, xfs_agnumber_t agno)
 		return(XR_EOF);
 	}
 
-	if ((rval = read(x.dfd, buf, size)) != size)  {
+	if ((rval = read(x.data.fd, buf, size)) != size)  {
 		error = errno;
 		do_warn(
 	_("superblock read failed, offset %" PRId64 ", size %d, ag %u, rval %d\n"),

@@ -22,6 +22,15 @@
 pthread_key_t	dblkmap_key;
 pthread_key_t	ablkmap_key;
 
+/*
+ * For 32 bit platforms, we are limited to extent arrays of 2^31 bytes, which
+ * limits the number of extents in an inode we can check. If we don't limit the
+ * valid range, we can overflow the BLKMAP_SIZE() calculation and allocate less
+ * memory than we think we needed, and hence walk off the end of the array and
+ * corrupt memory.
+ */
+#define BLKMAP_NEXTS32_MAX	((INT_MAX / sizeof(bmap_ext_t)) - 1)
+
 blkmap_t *
 blkmap_alloc(
 	xfs_extnum_t	nex,
@@ -34,25 +43,24 @@ blkmap_alloc(
 
 	if (nex < 1)
 		nex = 1;
+	nex = min(nex, XFS_MAX_EXTCNT_DATA_FORK_LARGE);
 
-#if (BITS_PER_LONG == 32)	/* on 64-bit platforms this is never true */
-	if (nex > BLKMAP_NEXTS_MAX) {
+	if (sizeof(long) == 4 && nex > BLKMAP_NEXTS32_MAX) {
 		do_warn(
-	_("Number of extents requested in blkmap_alloc (%d) overflows 32 bits.\n"
+	_("Number of extents requested in blkmap_alloc (%llu) overflows 32 bits.\n"
 	  "If this is not a corruption, then you will need a 64 bit system\n"
 	  "to repair this filesystem.\n"),
-			nex);
+			(unsigned long long)nex);
 		return NULL;
 	}
-#endif
 
 	key = whichfork ? ablkmap_key : dblkmap_key;
 	blkmap = pthread_getspecific(key);
 	if (!blkmap || blkmap->naexts < nex) {
 		blkmap = realloc(blkmap, BLKMAP_SIZE(nex));
 		if (!blkmap) {
-			do_warn(_("malloc failed in blkmap_alloc (%zu bytes)\n"),
-				BLKMAP_SIZE(nex));
+			do_warn(_("malloc failed in blkmap_alloc (%llu bytes)\n"),
+				(unsigned long long)BLKMAP_SIZE(nex));
 			return NULL;
 		}
 		pthread_setspecific(key, blkmap);
@@ -115,7 +123,7 @@ blkmap_get(
 	xfs_fileoff_t	o)
 {
 	bmap_ext_t	*ext = blkmap->exts;
-	int		i;
+	xfs_extnum_t	i;
 
 	for (i = 0; i < blkmap->nexts; i++, ext++) {
 		if (o >= ext->startoff && o < ext->startoff + ext->blockcount)
@@ -137,7 +145,7 @@ blkmap_getn(
 {
 	bmap_ext_t	*bmp = NULL;
 	bmap_ext_t	*ext;
-	int		i;
+	xfs_extnum_t	i;
 	int		nex;
 
 	if (nb == 1) {
@@ -233,7 +241,7 @@ xfs_fileoff_t
 blkmap_next_off(
 	blkmap_t	*blkmap,
 	xfs_fileoff_t	o,
-	int		*t)
+	xfs_extnum_t	*t)
 {
 	bmap_ext_t	*ext;
 
@@ -263,7 +271,7 @@ blkmap_grow(
 {
 	pthread_key_t	key = dblkmap_key;
 	blkmap_t	*new_blkmap;
-	int		new_naexts;
+	xfs_extnum_t	new_naexts;
 
 	/* reduce the number of reallocations for large files */
 	if (blkmap->naexts < 1000)
@@ -278,20 +286,20 @@ blkmap_grow(
 		ASSERT(pthread_getspecific(key) == blkmap);
 	}
 
-#if (BITS_PER_LONG == 32)	/* on 64-bit platforms this is never true */
-	if (new_naexts > BLKMAP_NEXTS_MAX) {
+	if (sizeof(long) == 4 && new_naexts > BLKMAP_NEXTS32_MAX) {
 		do_error(
-	_("Number of extents requested in blkmap_grow (%d) overflows 32 bits.\n"
+	_("Number of extents requested in blkmap_grow (%llu) overflows 32 bits.\n"
 	  "You need a 64 bit system to repair this filesystem.\n"),
-			new_naexts);
+			(unsigned long long)new_naexts);
 		return NULL;
 	}
-#endif
-	if (new_naexts <= 0) {
+
+	if (new_naexts > XFS_MAX_EXTCNT_DATA_FORK_LARGE) {
 		do_error(
-	_("Number of extents requested in blkmap_grow (%d) overflowed the\n"
-	  "maximum number of supported extents (%d).\n"),
-			new_naexts, BLKMAP_NEXTS_MAX);
+	_("Number of extents requested in blkmap_grow (%llu) overflowed the\n"
+	  "maximum number of supported extents (%llu).\n"),
+			(unsigned long long)new_naexts,
+			(unsigned long long)XFS_MAX_EXTCNT_DATA_FORK_LARGE);
 		return NULL;
 	}
 

@@ -4,9 +4,7 @@
  * All Rights Reserved.
  */
 
-#if defined(HAVE_FALLOCATE)
 #include <linux/falloc.h>
-#endif
 #include "command.h"
 #include "input.h"
 #include "init.h"
@@ -37,14 +35,12 @@ static cmdinfo_t freesp_cmd;
 static cmdinfo_t resvsp_cmd;
 static cmdinfo_t unresvsp_cmd;
 static cmdinfo_t zero_cmd;
-#if defined(HAVE_FALLOCATE)
 static cmdinfo_t falloc_cmd;
 static cmdinfo_t fpunch_cmd;
 static cmdinfo_t fcollapse_cmd;
 static cmdinfo_t finsert_cmd;
 static cmdinfo_t fzero_cmd;
 static cmdinfo_t funshare_cmd;
-#endif
 
 static int
 offset_length(
@@ -69,6 +65,17 @@ offset_length(
 	}
 	return 1;
 }
+
+/*
+ * These ioctls were withdrawn in Linux 5.17, but we'll keep them around for
+ * a few releases.
+ */
+#ifndef XFS_IOC_ALLOCSP64
+# define XFS_IOC_ALLOCSP64	_IOW ('X', 36, struct xfs_flock64)
+#endif
+#ifndef XFS_IOC_FREESP64
+# define XFS_IOC_FREESP64	_IOW ('X', 37, struct xfs_flock64)
+#endif
 
 static int
 allocsp_f(
@@ -171,7 +178,6 @@ zero_f(
 }
 
 
-#if defined (HAVE_FALLOCATE)
 static void
 falloc_help(void)
 {
@@ -370,7 +376,6 @@ funshare_f(
 	}
 	return 0;
 }
-#endif	/* HAVE_FALLOCATE */
 
 void
 prealloc_init(void)
@@ -424,7 +429,6 @@ prealloc_init(void)
 	add_command(&unresvsp_cmd);
 	add_command(&zero_cmd);
 
-#if defined (HAVE_FALLOCATE)
 	falloc_cmd.name = "falloc";
 	falloc_cmd.cfunc = fallocate_f;
 	falloc_cmd.argmin = 2;
@@ -485,5 +489,4 @@ prealloc_init(void)
 	funshare_cmd.oneline =
 	_("unshares shared blocks within the range");
 	add_command(&funshare_cmd);
-#endif	/* HAVE_FALLOCATE */
 }

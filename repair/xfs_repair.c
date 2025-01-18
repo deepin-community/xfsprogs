@@ -26,6 +26,7 @@
 #include "libfrog/platform.h"
 #include "bulkload.h"
 #include "quotacheck.h"
+#include "rcbag_btree.h"
 
 /*
  * option tables for getsubopt calls
@@ -67,6 +68,8 @@ enum c_opt_nums {
 	CONVERT_LAZY_COUNT = 0,
 	CONVERT_INOBTCOUNT,
 	CONVERT_BIGTIME,
+	CONVERT_NREXT64,
+	CONVERT_EXCHRANGE,
 	C_MAX_OPTS,
 };
 
@@ -74,6 +77,8 @@ static char *c_opts[] = {
 	[CONVERT_LAZY_COUNT]	= "lazycount",
 	[CONVERT_INOBTCOUNT]	= "inobtcount",
 	[CONVERT_BIGTIME]	= "bigtime",
+	[CONVERT_NREXT64]	= "nrext64",
+	[CONVERT_EXCHRANGE]	= "exchange",
 	[C_MAX_OPTS]		= NULL,
 };
 
@@ -250,14 +255,22 @@ process_args(int argc, char **argv)
 					if (!val)
 						do_abort(
 		_("-o bhash requires a parameter\n"));
+					errno = 0;
 					libxfs_bhash_size = (int)strtol(val, NULL, 0);
+					if (errno)
+						do_abort(
+		_("-o bhash invalid parameter: %s\n"), strerror(errno));
 					bhash_option_used = 1;
 					break;
 				case AG_STRIDE:
 					if (!val)
 						do_abort(
 		_("-o ag_stride requires a parameter\n"));
+					errno = 0;
 					ag_stride = (int)strtol(val, NULL, 0);
+					if (errno)
+						do_abort(
+		_("-o ag_stride invalid parameter: %s\n"), strerror(errno));
 					break;
 				case FORCE_GEO:
 					if (val)
@@ -270,19 +283,31 @@ process_args(int argc, char **argv)
 					if (!val)
 						do_abort(
 		_("-o phase2_threads requires a parameter\n"));
+					errno = 0;
 					phase2_threads = (int)strtol(val, NULL, 0);
+					if (errno)
+						do_abort(
+		_("-o phase2_threads invalid parameter: %s\n"), strerror(errno));
 					break;
 				case BLOAD_LEAF_SLACK:
 					if (!val)
 						do_abort(
 		_("-o debug_bload_leaf_slack requires a parameter\n"));
+					errno = 0;
 					bload_leaf_slack = (int)strtol(val, NULL, 0);
+					if (errno)
+						do_abort(
+		_("-o debug_bload_leaf_slack invalid parameter: %s\n"), strerror(errno));
 					break;
 				case BLOAD_NODE_SLACK:
 					if (!val)
 						do_abort(
 		_("-o debug_bload_node_slack requires a parameter\n"));
+					errno = 0;
 					bload_node_slack = (int)strtol(val, NULL, 0);
+					if (errno)
+						do_abort(
+		_("-o debug_bload_node_slack invalid parameter: %s\n"), strerror(errno));
 					break;
 				case NOQUOTA:
 					quotacheck_skip();
@@ -303,7 +328,11 @@ process_args(int argc, char **argv)
 					if (!val)
 						do_abort(
 		_("-c lazycount requires a parameter\n"));
+					errno = 0;
 					lazy_count = (int)strtol(val, NULL, 0);
+					if (errno)
+						do_abort(
+		_("-o lazycount invalid parameter: %s\n"), strerror(errno));
 					convert_lazy_count = 1;
 					break;
 				case CONVERT_INOBTCOUNT:
@@ -323,6 +352,24 @@ process_args(int argc, char **argv)
 						do_abort(
 		_("-c bigtime only supports upgrades\n"));
 					add_bigtime = true;
+					break;
+				case CONVERT_NREXT64:
+					if (!val)
+						do_abort(
+		_("-c nrext64 requires a parameter\n"));
+					if (strtol(val, NULL, 0) != 1)
+						do_abort(
+		_("-c nrext64 only supports upgrades\n"));
+					add_nrext64 = true;
+					break;
+				case CONVERT_EXCHRANGE:
+					if (!val)
+						do_abort(
+		_("-c exchange requires a parameter\n"));
+					if (strtol(val, NULL, 0) != 1)
+						do_abort(
+		_("-c exchange only supports upgrades\n"));
+					add_exchrange = true;
 					break;
 				default:
 					unknown('c', val);
@@ -345,7 +392,11 @@ process_args(int argc, char **argv)
 			if (bhash_option_used)
 				do_abort(_("-m option cannot be used with "
 						"-o bhash option\n"));
+			errno = 0;
 			max_mem_specified = strtol(optarg, NULL, 0);
+			if (errno)
+				do_abort(
+		_("%s: invalid memory amount: %s\n"), optarg, strerror(errno));
 			break;
 		case 'L':
 			zap_log = 1;
@@ -366,7 +417,11 @@ process_args(int argc, char **argv)
 			do_prefetch = 0;
 			break;
 		case 't':
-			report_interval = (int)strtol(optarg, NULL, 0);
+			errno = 0;
+			report_interval = strtol(optarg, NULL, 0);
+			if (errno)
+				do_abort(
+		_("%s: invalid interval: %s\n"), optarg, strerror(errno));
 			break;
 		case 'e':
 			report_corrected = true;
@@ -386,8 +441,14 @@ process_args(int argc, char **argv)
 		usage();
 
 	p = getenv("XFS_REPAIR_FAIL_AFTER_PHASE");
-	if (p)
+	if (p) {
+		errno = 0;
 		fail_after_phase = (int)strtol(p, NULL, 0);
+		if (errno)
+			do_abort(
+		_("%s: invalid phase in XFS_REPAIR_FAIL_AFTER_PHASE: %s\n"),
+				p, strerror(errno));
+	}
 }
 
 void __attribute__((noreturn))
@@ -713,13 +774,11 @@ static void
 check_fs_vs_host_sectsize(
 	struct xfs_sb	*sb)
 {
-	int	fd, ret;
+	int	ret;
 	long	old_flags;
 	struct xfs_fsop_geom	geom = { 0 };
 
-	fd = libxfs_device_to_fd(x.ddev);
-
-	ret = -xfrog_geometry(fd, &geom);
+	ret = -xfrog_geometry(x.data.fd, &geom);
 	if (ret) {
 		do_log(_("Cannot get host filesystem geometry.\n"
 	"Repair may fail if there is a sector size mismatch between\n"
@@ -728,8 +787,8 @@ check_fs_vs_host_sectsize(
 	}
 
 	if (sb->sb_sectsize < geom.sectsize) {
-		old_flags = fcntl(fd, F_GETFL, 0);
-		if (fcntl(fd, F_SETFL, old_flags & ~O_DIRECT) < 0) {
+		old_flags = fcntl(x.data.fd, F_GETFL, 0);
+		if (fcntl(x.data.fd, F_SETFL, old_flags & ~O_DIRECT) < 0) {
 			do_warn(_(
 	"Sector size on host filesystem larger than image sector size.\n"
 	"Cannot turn off direct IO, so exiting.\n"));
@@ -738,8 +797,65 @@ check_fs_vs_host_sectsize(
 	}
 }
 
+/*
+ * If we set up a writeback function to set NEEDSREPAIR while the filesystem is
+ * dirty, there's a chance that calling libxfs_getsb could deadlock the buffer
+ * cache while trying to get the primary sb buffer if the first non-sb write to
+ * the filesystem is the result of a cache shake.  Retain a reference to the
+ * primary sb buffer to avoid all that.
+ */
+static struct xfs_buf *primary_sb_bp;	/* buffer for superblock */
+
+int
+retain_primary_sb(
+	struct xfs_mount	*mp)
+{
+	int			error;
+
+	error = -libxfs_buf_read(mp->m_ddev_targp, XFS_SB_DADDR,
+			XFS_FSS_TO_BB(mp, 1), 0, &primary_sb_bp,
+			&xfs_sb_buf_ops);
+	if (error)
+		return error;
+
+	libxfs_buf_unlock(primary_sb_bp);
+	return 0;
+}
+
+static void
+drop_primary_sb(void)
+{
+	if (!primary_sb_bp)
+		return;
+
+	libxfs_buf_lock(primary_sb_bp);
+	libxfs_buf_relse(primary_sb_bp);
+	primary_sb_bp = NULL;
+}
+
+static int
+get_primary_sb(
+	struct xfs_mount	*mp,
+	struct xfs_buf		**bpp)
+{
+	int			error;
+
+	*bpp = NULL;
+
+	if (!primary_sb_bp) {
+		error = retain_primary_sb(mp);
+		if (error)
+			return error;
+	}
+
+	libxfs_buf_lock(primary_sb_bp);
+	xfs_buf_hold(primary_sb_bp);
+	*bpp = primary_sb_bp;
+	return 0;
+}
+
 /* Clear needsrepair after a successful repair run. */
-void
+static void
 clear_needsrepair(
 	struct xfs_mount	*mp)
 {
@@ -758,15 +874,14 @@ clear_needsrepair(
 		do_warn(
 	_("Cannot clear needsrepair due to flush failure, err=%d.\n"),
 			error);
-		return;
+		goto drop;
 	}
 
 	/* Clear needsrepair from the superblock. */
-	bp = libxfs_getsb(mp);
-	if (!bp || bp->b_error) {
+	error = get_primary_sb(mp, &bp);
+	if (error) {
 		do_warn(
-	_("Cannot clear needsrepair from primary super, err=%d.\n"),
-			bp ? bp->b_error : ENOMEM);
+	_("Cannot clear needsrepair from primary super, err=%d.\n"), error);
 	} else {
 		mp->m_sb.sb_features_incompat &=
 				~XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR;
@@ -775,6 +890,8 @@ clear_needsrepair(
 	}
 	if (bp)
 		libxfs_buf_relse(bp);
+drop:
+	drop_primary_sb();
 }
 
 static void
@@ -797,11 +914,10 @@ force_needsrepair(
 	    xfs_sb_version_needsrepair(&mp->m_sb))
 		return;
 
-	bp = libxfs_getsb(mp);
-	if (!bp || bp->b_error) {
+	error = get_primary_sb(mp, &bp);
+	if (error) {
 		do_log(
-	_("couldn't get superblock to set needsrepair, err=%d\n"),
-				bp ? bp->b_error : ENOMEM);
+	_("couldn't get superblock to set needsrepair, err=%d\n"), error);
 	} else {
 		/*
 		 * It's possible that we need to set NEEDSREPAIR before we've
@@ -845,6 +961,12 @@ repair_capture_writeback(
 	struct xfs_mount	*mp = bp->b_mount;
 	static pthread_mutex_t	wb_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+	/* We only care about ondisk metadata. */
+	if (bp->b_target != mp->m_ddev_targp &&
+	    bp->b_target != mp->m_logdev_targp &&
+	    bp->b_target != mp->m_rtdev_targp)
+		return;
+
 	/*
 	 * This write hook ignores any buffer that looks like a superblock to
 	 * avoid hook recursion when setting NEEDSREPAIR.  Higher level code
@@ -876,13 +998,29 @@ unlock:
 }
 
 static inline void
-phase_end(int phase)
+phase_end(
+	struct xfs_mount	*mp,
+	int			phase)
 {
-	timestamp(PHASE_END, phase, NULL);
+	timestamp(mp, PHASE_END, phase, NULL);
 
 	/* Fail if someone injected an post-phase error. */
 	if (fail_after_phase && phase == fail_after_phase)
 		platform_crash();
+}
+
+/* Try to allow as many memfds as possible. */
+static void
+bump_max_fds(void)
+{
+	struct rlimit	rlim = { };
+	int		ret;
+
+	ret = getrlimit(RLIMIT_NOFILE, &rlim);
+	if (!ret) {
+		rlim.rlim_cur = rlim.rlim_max;
+		setrlimit(RLIMIT_NOFILE, &rlim);
+	}
 }
 
 int
@@ -891,7 +1029,7 @@ main(int argc, char **argv)
 	xfs_mount_t	*temp_mp;
 	xfs_mount_t	*mp;
 	struct xfs_buf	*sbp;
-	xfs_mount_t	xfs_m;
+	struct xfs_mount xfs_m = { };
 	struct xlog	log = {0};
 	char		*msgbuf;
 	struct xfs_sb	psb;
@@ -904,6 +1042,7 @@ main(int argc, char **argv)
 	bindtextdomain(PACKAGE, LOCALEDIR);
 	textdomain(PACKAGE);
 	dinode_bmbt_translation_init();
+	bump_max_fds();
 
 	temp_mp = &xfs_m;
 	setbuf(stdout, NULL);
@@ -913,15 +1052,14 @@ main(int argc, char **argv)
 
 	msgbuf = malloc(DURATION_BUF_SIZE);
 
-	timestamp(PHASE_START, 0, NULL);
-	phase_end(0);
+	timestamp(temp_mp, PHASE_START, 0, NULL);
+	phase_end(temp_mp, 0);
 
 	/* -f forces this, but let's be nice and autodetect it, as well. */
 	if (!isa_file) {
-		int		fd = libxfs_device_to_fd(x.ddev);
 		struct stat	statbuf;
 
-		if (fstat(fd, &statbuf) < 0)
+		if (fstat(x.data.fd, &statbuf) < 0)
 			do_warn(_("%s: couldn't stat \"%s\"\n"),
 				progname, fs_name);
 		else if (S_ISREG(statbuf.st_mode))
@@ -937,7 +1075,7 @@ main(int argc, char **argv)
 
 	/* do phase1 to make sure we have a superblock */
 	phase1(temp_mp);
-	phase_end(1);
+	phase_end(temp_mp, 1);
 
 	if (no_modify && primary_sb_modified)  {
 		do_warn(_("Primary superblock would have been modified.\n"
@@ -966,7 +1104,7 @@ main(int argc, char **argv)
 	 * initialized in phase 2.
 	 */
 	memset(&xfs_m, 0, sizeof(xfs_mount_t));
-	mp = libxfs_mount(&xfs_m, &psb, x.ddev, x.logdev, x.rtdev, 0);
+	mp = libxfs_mount(&xfs_m, &psb, &x, 0);
 
 	if (!mp)  {
 		fprintf(stderr,
@@ -1074,8 +1212,8 @@ main(int argc, char **argv)
 		unsigned long	max_mem;
 		struct rlimit	rlim;
 
-		libxfs_bcache_purge();
-		cache_destroy(libxfs_bcache);
+		libxfs_bcache_purge(mp);
+		cache_destroy(mp->m_ddev_targp->bcache);
 
 		mem_used = (mp->m_sb.sb_icount >> (10 - 2)) +
 					(mp->m_sb.sb_dblocks >> (10 + 1)) +
@@ -1135,7 +1273,7 @@ main(int argc, char **argv)
 			do_log(_("        - block cache size set to %d entries\n"),
 				libxfs_bhash_size * HASH_CACHE_RATIO);
 
-		libxfs_bcache = cache_init(0, libxfs_bhash_size,
+		mp->m_ddev_targp->bcache = cache_init(0, libxfs_bhash_size,
 						&libxfs_bcache_operations);
 	}
 
@@ -1163,23 +1301,28 @@ main(int argc, char **argv)
 
 	/* make sure the per-ag freespace maps are ok so we can mount the fs */
 	phase2(mp, phase2_threads);
-	phase_end(2);
+	phase_end(mp, 2);
 
 	if (do_prefetch)
 		init_prefetch(mp);
 
 	phase3(mp, phase2_threads);
-	phase_end(3);
+	phase_end(mp, 3);
+
+	error = rcbagbt_init_cur_cache();
+	if (error)
+		do_error(_("could not allocate btree cursor memory\n"));
 
 	phase4(mp);
-	phase_end(4);
+	phase_end(mp, 4);
 
-	if (no_modify)
+	if (no_modify) {
 		printf(_("No modify flag set, skipping phase 5\n"));
-	else {
+	} else {
 		phase5(mp);
 	}
-	phase_end(5);
+	phase_end(mp, 5);
+	rcbagbt_destroy_cur_cache();
 
 	/*
 	 * Done with the block usage maps, toss them...
@@ -1189,10 +1332,10 @@ main(int argc, char **argv)
 
 	if (!bad_ino_btree)  {
 		phase6(mp);
-		phase_end(6);
+		phase_end(mp, 6);
 
 		phase7(mp, phase2_threads);
-		phase_end(7);
+		phase_end(mp, 7);
 	} else  {
 		do_warn(
 _("Inode allocation btrees are too corrupted, skipping phases 6 and 7\n"));
@@ -1317,7 +1460,7 @@ _("Note - stripe unit (%d) and width (%d) were copied from a backup superblock.\
 	 * verifiers are run (where we discover the max metadata LSN), reformat
 	 * the log if necessary and unmount.
 	 */
-	libxfs_bcache_flush();
+	libxfs_bcache_flush(mp);
 	format_log_max_lsn(mp);
 
 	if (xfs_sb_version_needsrepair(&mp->m_sb))

@@ -132,8 +132,8 @@ static unsigned		sbversion;
 static int		sbver_err;
 static int		serious_error;
 static int		sflag;
-static xfs_suminfo_t	*sumcompute;
-static xfs_suminfo_t	*sumfile;
+static union xfs_suminfo_raw *sumcompute;
+static union xfs_suminfo_raw *sumfile;
 static const char	*typename[] = {
 	"unknown",
 	"agf",
@@ -272,9 +272,9 @@ static int		ncheck_f(int argc, char **argv);
 static char		*prepend_path(char *oldpath, char *parent);
 static xfs_ino_t	process_block_dir_v2(blkmap_t *blkmap, int *dot,
 					     int *dotdot, inodata_t *id);
-static void		process_bmbt_reclist(xfs_bmbt_rec_t *rp, int numrecs,
-					     dbm_t type, inodata_t *id,
-					     xfs_rfsblock_t *tot,
+static void		process_bmbt_reclist(xfs_bmbt_rec_t *rp,
+					     xfs_extnum_t numrecs, dbm_t type,
+					     inodata_t *id, xfs_rfsblock_t *tot,
 					     blkmap_t **blkmapp);
 static void		process_btinode(inodata_t *id, struct xfs_dinode *dip,
 					dbm_t type, xfs_rfsblock_t *totd,
@@ -1704,12 +1704,20 @@ check_set_rdbmap(
 	}
 }
 
+static inline xfs_suminfo_t
+get_suminfo(
+	struct xfs_mount	*mp,
+	union xfs_suminfo_raw	*raw)
+{
+	return raw->old;
+}
+
 static void
 check_summary(void)
 {
 	xfs_rfsblock_t	bno;
-	xfs_suminfo_t	*csp;
-	xfs_suminfo_t	*fsp;
+	union xfs_suminfo_raw *csp;
+	union xfs_suminfo_raw *fsp;
 	int		log;
 
 	csp = sumcompute;
@@ -1718,12 +1726,14 @@ check_summary(void)
 		for (bno = 0;
 		     bno < mp->m_sb.sb_rbmblocks;
 		     bno++, csp++, fsp++) {
-			if (*csp != *fsp) {
+			if (csp->old != fsp->old) {
 				if (!sflag)
 					dbprintf(_("rt summary mismatch, size %d "
 						 "block %llu, file: %d, "
 						 "computed: %d\n"),
-						log, bno, *fsp, *csp);
+						log, bno,
+						get_suminfo(mp, fsp),
+						get_suminfo(mp, csp));
 				error++;
 			}
 		}
@@ -1944,10 +1954,13 @@ init(
 		inodata[c] = xcalloc(inodata_hash_size, sizeof(**inodata));
 	}
 	if (rt) {
+		unsigned long long	words;
+
 		dbmap[c] = xcalloc(mp->m_sb.sb_rblocks, sizeof(**dbmap));
 		inomap[c] = xcalloc(mp->m_sb.sb_rblocks, sizeof(**inomap));
-		sumfile = xcalloc(mp->m_rsumsize, 1);
-		sumcompute = xcalloc(mp->m_rsumsize, 1);
+		words = XFS_FSB_TO_B(mp, mp->m_rsumblocks) >> XFS_WORDLOG;
+		sumfile = xcalloc(words, sizeof(union xfs_suminfo_raw));
+		sumcompute = xcalloc(words, sizeof(union xfs_suminfo_raw));
 	}
 	nflag = sflag = tflag = verbose = optind = 0;
 	while ((c = getopt(argc, argv, "b:i:npstv")) != EOF) {
@@ -2176,7 +2189,7 @@ process_block_dir_v2(
 static void
 process_bmbt_reclist(
 	xfs_bmbt_rec_t		*rp,
-	int			numrecs,
+	xfs_extnum_t		numrecs,
 	dbm_t			type,
 	inodata_t		*id,
 	xfs_rfsblock_t		*tot,
@@ -2188,7 +2201,7 @@ process_bmbt_reclist(
 	xfs_filblks_t		c;
 	xfs_filblks_t		cp;
 	int			f;
-	int			i;
+	xfs_extnum_t		i;
 	xfs_agblock_t		iagbno;
 	xfs_agnumber_t		iagno;
 	xfs_fileoff_t		o;
@@ -2308,13 +2321,13 @@ process_btinode(
 		return;
 	}
 	if (be16_to_cpu(dib->bb_level) == 0) {
-		xfs_bmbt_rec_t	*rp = XFS_BMDR_REC_ADDR(dib, 1);
+		xfs_bmbt_rec_t	*rp = xfs_bmdr_rec_addr(dib, 1);
 		process_bmbt_reclist(rp, be16_to_cpu(dib->bb_numrecs), type,
 							id, totd, blkmapp);
 		*nex += be16_to_cpu(dib->bb_numrecs);
 		return;
 	} else {
-		pp = XFS_BMDR_PTR_ADDR(dib, 1, libxfs_bmdr_maxrecs(
+		pp = xfs_bmdr_ptr_addr(dib, 1, libxfs_bmdr_maxrecs(
 				XFS_DFORK_SIZE(dip, mp, whichfork), 0));
 		for (i = 0; i < be16_to_cpu(dib->bb_numrecs); i++)
 			scan_lbtree(get_unaligned_be64(&pp[i]),
@@ -2578,7 +2591,7 @@ process_data_dir_v2(
 		error++;
 	}
 	if ((be32_to_cpu(data->magic) == XFS_DIR2_BLOCK_MAGIC ||
-	     be32_to_cpu(data->magic) == XFS_DIR2_BLOCK_MAGIC) &&
+	     be32_to_cpu(data->magic) == XFS_DIR3_BLOCK_MAGIC) &&
 					stale != be32_to_cpu(btp->stale)) {
 		if (!sflag || v)
 			dbprintf(_("dir %lld block %d bad stale tail count %d\n"),
@@ -2711,14 +2724,18 @@ process_exinode(
 	int			whichfork)
 {
 	xfs_bmbt_rec_t		*rp;
+	xfs_extnum_t		max_nex;
 
 	rp = (xfs_bmbt_rec_t *)XFS_DFORK_PTR(dip, whichfork);
-	*nex = XFS_DFORK_NEXTENTS(dip, whichfork);
-	if (*nex < 0 || *nex > XFS_DFORK_SIZE(dip, mp, whichfork) /
+	*nex = xfs_dfork_nextents(dip, whichfork);
+	max_nex = xfs_iext_max_nextents(
+			xfs_dinode_has_large_extent_counts(dip),
+			whichfork);
+	if (*nex > max_nex || *nex > XFS_DFORK_SIZE(dip, mp, whichfork) /
 						sizeof(xfs_bmbt_rec_t)) {
 		if (!sflag || id->ilist)
-			dbprintf(_("bad number of extents %d for inode %lld\n"),
-				*nex, id->ino);
+			dbprintf(_("bad number of extents %llu for inode %lld\n"),
+				(unsigned long long)*nex, id->ino);
 		error++;
 		return;
 	}
@@ -2737,12 +2754,14 @@ process_inode(
 	inodata_t		*id = NULL;
 	xfs_ino_t		ino;
 	xfs_extnum_t		nextents = 0;
+	xfs_extnum_t		dnextents;
 	int			security;
 	xfs_rfsblock_t		totblocks;
 	xfs_rfsblock_t		totdblocks = 0;
 	xfs_rfsblock_t		totiblocks = 0;
 	dbm_t			type;
 	xfs_extnum_t		anextents = 0;
+	xfs_extnum_t		danextents;
 	xfs_rfsblock_t		atotdblocks = 0;
 	xfs_rfsblock_t		atotiblocks = 0;
 	xfs_qcnt_t		bc = 0;
@@ -2871,14 +2890,17 @@ process_inode(
 		error++;
 		return;
 	}
+
+	dnextents = xfs_dfork_data_extents(dip);
+	danextents = xfs_dfork_attr_extents(dip);
+
 	if (verbose || (id && id->ilist) || CHECK_BLIST(bno))
 		dbprintf(_("inode %lld mode %#o fmt %s "
 			 "afmt %s "
 			 "nex %d anex %d nblk %lld sz %lld%s%s%s%s%s%s%s\n"),
 			id->ino, mode, fmtnames[(int)dip->di_format],
 			fmtnames[(int)dip->di_aformat],
-			be32_to_cpu(dip->di_nextents),
-			be16_to_cpu(dip->di_anextents),
+			dnextents, danextents,
 			be64_to_cpu(dip->di_nblocks), be64_to_cpu(dip->di_size),
 			diflags & XFS_DIFLAG_REALTIME ? " rt" : "",
 			diflags & XFS_DIFLAG_PREALLOC ? " pre" : "",
@@ -2893,25 +2915,25 @@ process_inode(
 		type = DBM_DIR;
 		if (dip->di_format == XFS_DINODE_FMT_LOCAL)
 			break;
-		blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+		blkmap = blkmap_alloc(dnextents);
 		break;
 	case S_IFREG:
 		if (diflags & XFS_DIFLAG_REALTIME)
 			type = DBM_RTDATA;
 		else if (id->ino == mp->m_sb.sb_rbmino) {
 			type = DBM_RTBITMAP;
-			blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+			blkmap = blkmap_alloc(dnextents);
 			addlink_inode(id);
 		} else if (id->ino == mp->m_sb.sb_rsumino) {
 			type = DBM_RTSUM;
-			blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+			blkmap = blkmap_alloc(dnextents);
 			addlink_inode(id);
 		}
 		else if (id->ino == mp->m_sb.sb_uquotino ||
 			 id->ino == mp->m_sb.sb_gquotino ||
 			 id->ino == mp->m_sb.sb_pquotino) {
 			type = DBM_QUOTA;
-			blkmap = blkmap_alloc(be32_to_cpu(dip->di_nextents));
+			blkmap = blkmap_alloc(dnextents);
 			addlink_inode(id);
 		}
 		else
@@ -2993,17 +3015,17 @@ process_inode(
 				be64_to_cpu(dip->di_nblocks), id->ino, totblocks);
 		error++;
 	}
-	if (nextents != be32_to_cpu(dip->di_nextents)) {
+	if (nextents != dnextents) {
 		if (v)
 			dbprintf(_("bad nextents %d for inode %lld, counted %d\n"),
-				be32_to_cpu(dip->di_nextents), id->ino, nextents);
+				dnextents, id->ino, nextents);
 		error++;
 	}
-	if (anextents != be16_to_cpu(dip->di_anextents)) {
+	if (anextents != danextents) {
 		if (v)
 			dbprintf(_("bad anextents %d for inode %lld, counted "
 				 "%d\n"),
-				be16_to_cpu(dip->di_anextents), id->ino, anextents);
+				danextents, id->ino, anextents);
 		error++;
 	}
 	if (type == DBM_DIR)
@@ -3046,7 +3068,7 @@ process_lclinode(
 	blkmap_t			**blkmapp,
 	int				whichfork)
 {
-	struct xfs_attr_shortform	*asf;
+	struct xfs_attr_sf_hdr		*hdr;
 	xfs_fsblock_t			bno;
 
 	bno = XFS_INO_TO_FSB(mp, id->ino);
@@ -3059,12 +3081,12 @@ process_lclinode(
 		error++;
 	}
 	else if (whichfork == XFS_ATTR_FORK) {
-		asf = (struct xfs_attr_shortform *)XFS_DFORK_APTR(dip);
-		if (be16_to_cpu(asf->hdr.totsize) > XFS_DFORK_ASIZE(dip, mp)) {
+		hdr = XFS_DFORK_APTR(dip);
+		if (be16_to_cpu(hdr->totsize) > XFS_DFORK_ASIZE(dip, mp)) {
 			if (!sflag || id->ilist || CHECK_BLIST(bno))
 				dbprintf(_("local inode %lld attr is too large "
 					 "(size %d)\n"),
-					id->ino, be16_to_cpu(asf->hdr.totsize));
+					id->ino, be16_to_cpu(hdr->totsize));
 			error++;
 		}
 	}
@@ -3443,7 +3465,7 @@ process_leaf_node_dir_v2_int(
 				 id->ino, dabno, stale,
 				 be16_to_cpu(leaf3->hdr.stale));
 		error++;
-	} else if (!leaf && stale != be16_to_cpu(leaf->hdr.stale)) {
+	} else if (!leaf3 && stale != be16_to_cpu(leaf->hdr.stale)) {
 		if (!sflag || v)
 			dbprintf(_("dir %lld block %d stale mismatch "
 				 "%d/%d\n"),
@@ -3577,6 +3599,17 @@ process_quota(
 	}
 }
 
+static inline void
+inc_sumcount(
+	struct xfs_mount	*mp,
+	union xfs_suminfo_raw	*info,
+	xfs_rtsumoff_t		index)
+{
+	union xfs_suminfo_raw	*p = info + index;
+
+	p->old++;
+}
+
 static void
 process_rtbitmap(
 	blkmap_t	*blkmap)
@@ -3585,7 +3618,7 @@ process_rtbitmap(
 	int		bitsperblock;
 	xfs_fileoff_t	bmbno;
 	xfs_fsblock_t	bno;
-	xfs_rtblock_t	extno;
+	xfs_rtxnum_t	extno;
 	int		len;
 	int		log;
 	int		offs;
@@ -3596,11 +3629,22 @@ process_rtbitmap(
 	int		t;
 	xfs_rtword_t	*words;
 
-	bitsperblock = mp->m_sb.sb_blocksize * NBBY;
+	bitsperblock = mp->m_blockwsize << XFS_NBWORDLOG;
+	words = malloc(mp->m_blockwsize << XFS_WORDLOG);
+	if (!words) {
+		dbprintf(_("could not allocate rtwords buffer\n"));
+		error++;
+		return;
+	}
 	bit = extno = prevbit = start_bmbno = start_bit = 0;
 	bmbno = NULLFILEOFF;
-	while ((bmbno = blkmap_next_off(blkmap, bmbno, &t)) !=
-	       NULLFILEOFF) {
+	while ((bmbno = blkmap_next_off(blkmap, bmbno, &t)) != NULLFILEOFF) {
+		struct xfs_rtalloc_args	args = {
+			.mp		= mp,
+		};
+		xfs_rtword_t	*incore = words;
+		unsigned int	i;
+
 		bno = blkmap_get(blkmap, bmbno);
 		if (bno == NULLFSBLOCK) {
 			if (!sflag)
@@ -3613,7 +3657,7 @@ process_rtbitmap(
 		push_cur();
 		set_cur(&typtab[TYP_RTBITMAP], XFS_FSB_TO_DADDR(mp, bno), blkbb,
 			DB_RING_IGN, NULL);
-		if ((words = iocur_top->data) == NULL) {
+		if (!iocur_top->bp) {
 			if (!sflag)
 				dbprintf(_("can't read block %lld for rtbitmap "
 					 "inode\n"),
@@ -3622,6 +3666,11 @@ process_rtbitmap(
 			pop_cur();
 			continue;
 		}
+
+		args.rbmbp = iocur_top->bp;
+		for (i = 0; i < mp->m_blockwsize; i++, incore++)
+			*incore = libxfs_rtbitmap_getword(&args, i);
+
 		for (bit = 0;
 		     bit < bitsperblock && extno < mp->m_sb.sb_rextents;
 		     bit++, extno++) {
@@ -3638,9 +3687,9 @@ process_rtbitmap(
 			} else if (prevbit == 1) {
 				len = ((int)bmbno - start_bmbno) *
 					bitsperblock + (bit - start_bit);
-				log = XFS_RTBLOCKLOG(len);
-				offs = XFS_SUMOFFS(mp, log, start_bmbno);
-				sumcompute[offs]++;
+				log = libxfs_highbit64(len);
+				offs = xfs_rtsumoffs(mp, log, start_bmbno);
+				inc_sumcount(mp, sumcompute, offs);
 				prevbit = 0;
 			}
 		}
@@ -3651,10 +3700,11 @@ process_rtbitmap(
 	if (prevbit == 1) {
 		len = ((int)bmbno - start_bmbno) * bitsperblock +
 			(bit - start_bit);
-		log = XFS_RTBLOCKLOG(len);
-		offs = XFS_SUMOFFS(mp, log, start_bmbno);
-		sumcompute[offs]++;
+		log = libxfs_highbit64(len);
+		offs = xfs_rtsumoffs(mp, log, start_bmbno);
+		inc_sumcount(mp, sumcompute, offs);
 	}
+	free(words);
 }
 
 static void
@@ -3662,12 +3712,17 @@ process_rtsummary(
 	blkmap_t	*blkmap)
 {
 	xfs_fsblock_t	bno;
-	char		*bytes;
+	union xfs_suminfo_raw *sfile = sumfile;
 	xfs_fileoff_t	sumbno;
 	int		t;
 
 	sumbno = NULLFILEOFF;
 	while ((sumbno = blkmap_next_off(blkmap, sumbno, &t)) != NULLFILEOFF) {
+		struct xfs_rtalloc_args	args = {
+			.mp		= mp,
+		};
+		union xfs_suminfo_raw	*ondisk;
+
 		bno = blkmap_get(blkmap, sumbno);
 		if (bno == NULLFSBLOCK) {
 			if (!sflag)
@@ -3680,18 +3735,22 @@ process_rtsummary(
 		push_cur();
 		set_cur(&typtab[TYP_RTSUMMARY], XFS_FSB_TO_DADDR(mp, bno),
 			blkbb, DB_RING_IGN, NULL);
-		if ((bytes = iocur_top->data) == NULL) {
+		if (!iocur_top->bp) {
 			if (!sflag)
 				dbprintf(_("can't read block %lld for rtsummary "
 					 "inode\n"),
 					(xfs_fileoff_t)sumbno);
 			error++;
 			pop_cur();
+			sfile += mp->m_blockwsize;
 			continue;
 		}
-		memcpy((char *)sumfile + sumbno * mp->m_sb.sb_blocksize, bytes,
-			mp->m_sb.sb_blocksize);
+
+		args.sumbp = iocur_top->bp;
+		ondisk = xfs_rsumblock_infoptr(&args, 0);
+		memcpy(sfile, ondisk, mp->m_blockwsize << XFS_WORDLOG);
 		pop_cur();
+		sfile += mp->m_blockwsize;
 	}
 }
 
@@ -4035,18 +4094,18 @@ scan_ag(
 	scan_freelist(agf);
 	fdblocks--;
 	scan_sbtree(agf,
-		be32_to_cpu(agf->agf_roots[XFS_BTNUM_BNO]),
-		be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNO]),
+		be32_to_cpu(agf->agf_bno_root),
+		be32_to_cpu(agf->agf_bno_level),
 		1, scanfunc_bno, TYP_BNOBT);
 	fdblocks--;
 	scan_sbtree(agf,
-		be32_to_cpu(agf->agf_roots[XFS_BTNUM_CNT]),
-		be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNT]),
+		be32_to_cpu(agf->agf_cnt_root),
+		be32_to_cpu(agf->agf_cnt_level),
 		1, scanfunc_cnt, TYP_CNTBT);
-	if (agf->agf_roots[XFS_BTNUM_RMAP]) {
+	if (agf->agf_rmap_root) {
 		scan_sbtree(agf,
-			be32_to_cpu(agf->agf_roots[XFS_BTNUM_RMAP]),
-			be32_to_cpu(agf->agf_levels[XFS_BTNUM_RMAP]),
+			be32_to_cpu(agf->agf_rmap_root),
+			be32_to_cpu(agf->agf_rmap_level),
 			1, scanfunc_rmap, TYP_RMAPBT);
 	}
 	if (agf->agf_refcount_root) {
@@ -4298,7 +4357,7 @@ scanfunc_bmap(
 			error++;
 			return;
 		}
-		rp = XFS_BMBT_REC_ADDR(mp, block, 1);
+		rp = xfs_bmbt_rec_addr(mp, block, 1);
 		*nex += be16_to_cpu(block->bb_numrecs);
 		process_bmbt_reclist(rp, be16_to_cpu(block->bb_numrecs), type, id, totd,
 			blkmapp);
@@ -4314,7 +4373,7 @@ scanfunc_bmap(
 		error++;
 		return;
 	}
-	pp = XFS_BMBT_PTR_ADDR(mp, block, 1, mp->m_bmap_dmxr[0]);
+	pp = xfs_bmbt_ptr_addr(mp, block, 1, mp->m_bmap_dmxr[0]);
 	for (i = 0; i < be16_to_cpu(block->bb_numrecs); i++)
 		scan_lbtree(be64_to_cpu(pp[i]), level, scanfunc_bmap, type, id,
 					totd, toti, nex, blkmapp, 0, btype);
@@ -4839,8 +4898,8 @@ scanfunc_refcnt(
 				char		*msg;
 
 				agbno = be32_to_cpu(rp[i].rc_startblock);
-				if (agbno >= XFS_REFC_COW_START) {
-					agbno -= XFS_REFC_COW_START;
+				if (agbno & XFS_REFC_COWFLAG) {
+					agbno &= ~XFS_REFC_COWFLAG;
 					msg = _(
 		"leftover CoW extent (%u/%u) len %u\n");
 				} else {

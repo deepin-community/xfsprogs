@@ -1,13 +1,20 @@
-AC_INIT([xfsprogs], [5.16.0], [linux-xfs@vger.kernel.org])
-AC_PREREQ(2.50)
+AC_INIT([xfsprogs],[6.12.0],[linux-xfs@vger.kernel.org])
+AC_PREREQ([2.69])
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([include/libxfs.h])
-AC_CONFIG_HEADER(include/platform_defs.h)
 AC_PREFIX_DEFAULT(/usr)
 
+# Default CFLAGS if nobody specifies anything else
+if test "${CFLAGS+set}" != "set"; then
+	CFLAGS="-g -O2 -std=gnu11"
+fi
+if test "${CXXFLAGS+set}" != "set"; then
+	CXXFLAGS="-g -O2 -std=gnu++11"
+fi
+
 AC_PROG_INSTALL
-AC_PROG_LIBTOOL
+LT_INIT
 
 AC_PROG_CC
 AC_ARG_VAR(BUILD_CC, [C compiler for build tools])
@@ -23,9 +30,12 @@ if test "${BUILD_CFLAGS+set}" != "set"; then
   if test $cross_compiling = no; then
     BUILD_CFLAGS="$CFLAGS"
   else
-    BUILD_CFLAGS="-g -O2"
+    BUILD_CFLAGS="-g -O2 -std=gnu11"
   fi
 fi
+
+AC_PROG_CXX
+# no C++ build tools yet
 
 AC_ARG_ENABLE(shared,
 [  --enable-shared=[yes/no]  Enable use of shared libraries [default=yes]],,
@@ -36,11 +46,6 @@ AC_ARG_ENABLE(gettext,
 [  --enable-gettext=[yes/no] Enable alternate language support [default=yes]],,
 	enable_gettext=yes)
 AC_SUBST(enable_gettext)
-
-AC_ARG_ENABLE(blkid,
-[  --enable-blkid=[yes/no]   Enable use of block device id library [default=yes]],,
-	enable_blkid=yes)
-AC_SUBST(enable_blkid)
 
 AC_ARG_ENABLE(editline,
 [  --enable-editline=[yes/no] Enable editline command editing [default=no]],
@@ -59,6 +64,11 @@ AC_ARG_ENABLE(lib64,
 [  --enable-lib64=[yes/no]   Enable lib64 support [default=yes]],,
 	enable_lib64=yes)
 AC_SUBST(enable_lib64)
+
+AC_ARG_WITH([multiarch],
+[  --with-multiarch=ARCH   Specify the multiarch triplet],
+	multiarch=$withval)
+AC_SUBST(multiarch)
 
 AC_ARG_ENABLE(librt,
 [  --enable-librt=[yes/no]   Enable librt support [default=yes]],,
@@ -110,25 +120,9 @@ lib64)
 esac
 
 #
-# Some important tools should be installed into the root partitions.
+# If the user specified a multiarch path then disable lib64
 #
-# Check whether exec_prefix=/usr: and install them to /sbin in that
-# case.  If the user chooses a different prefix assume they just want
-# a local install for testing and not a system install.
-#
-case $exec_prefix:$prefix in
-NONE:NONE | NONE:/usr | /usr:*)
-  root_sbindir='/sbin'
-  root_libdir="/${base_libdir}"
-  ;;
-*)
-  root_sbindir="${sbindir}"
-  root_libdir="${libdir}"
-  ;;
-esac
-
-AC_SUBST([root_sbindir])
-AC_SUBST([root_libdir])
+test -n "$multiarch" && enable_lib64=no
 
 # Find localized files.  Don't descend into any "dot directories"
 # (like .git or .pc from quilt).  Strangely, the "-print" argument
@@ -143,6 +137,7 @@ AC_SUBST(LOCALIZED_FILES)
 AC_PACKAGE_GLOBALS(xfsprogs)
 AC_PACKAGE_UTILITIES(xfsprogs)
 AC_MULTILIB($enable_lib64)
+AC_MULTIARCH($multiarch)
 AC_RT($enable_librt)
 
 AC_PACKAGE_NEED_INI_H
@@ -157,32 +152,19 @@ AC_PACKAGE_NEED_PTHREADMUTEXINIT
 AC_PACKAGE_NEED_URCU_H
 AC_PACKAGE_NEED_RCU_INIT
 
-AC_HAVE_FADVISE
-AC_HAVE_MADVISE
-AC_HAVE_MINCORE
-AC_HAVE_SENDFILE
-AC_HAVE_GETMNTENT
-AC_HAVE_FALLOCATE
-AC_HAVE_FIEMAP
 AC_HAVE_PWRITEV2
-AC_HAVE_PREADV
 AC_HAVE_COPY_FILE_RANGE
-AC_HAVE_SYNC_FILE_RANGE
-AC_HAVE_SYNCFS
-AC_HAVE_MNTENT
-AC_HAVE_FLS
-AC_HAVE_READDIR
-AC_HAVE_FSETXATTR
-AC_HAVE_MREMAP
 AC_NEED_INTERNAL_FSXATTR
 AC_NEED_INTERNAL_FSCRYPT_ADD_KEY_ARG
+AC_NEED_INTERNAL_FSCRYPT_POLICY_V2
+AC_NEED_INTERNAL_STATX
 AC_HAVE_GETFSMAP
-AC_HAVE_STATFS_FLAGS
 AC_HAVE_MAP_SYNC
 AC_HAVE_DEVMAPPER
 AC_HAVE_MALLINFO
-AC_PACKAGE_WANT_ATTRIBUTES_H
-AC_HAVE_LIBATTR
+AC_HAVE_MALLINFO2
+AC_HAVE_MEMFD_CREATE
+AC_HAVE_GETRANDOM_NONBLOCK
 if test "$enable_scrub" = "yes"; then
         if test "$enable_libicu" = "yes" || test "$enable_libicu" = "probe"; then
                 AC_HAVE_LIBICU
@@ -191,16 +173,10 @@ if test "$enable_scrub" = "yes"; then
                 AC_MSG_ERROR([libicu not found.])
         fi
 fi
-AC_HAVE_OPENAT
-AC_HAVE_FSTATAT
-AC_HAVE_SG_IO
-AC_HAVE_HDIO_GETGEO
 AC_CONFIG_SYSTEMD_SYSTEM_UNIT_DIR
 AC_CONFIG_CROND_DIR
-
-if test "$enable_blkid" = yes; then
+AC_CONFIG_UDEV_RULE_DIR
 AC_HAVE_BLKID_TOPO
-fi
 
 if test "$enable_ubsan" = "yes" || test "$enable_ubsan" = "probe"; then
         AC_PACKAGE_CHECK_UBSAN
@@ -234,9 +210,6 @@ if test "$enable_lto" = "yes" && test "$have_lto" != "yes"; then
 	AC_MSG_ERROR([LTO not supported by compiler.])
 fi
 
-AC_CHECK_SIZEOF([long])
-AC_CHECK_SIZEOF([char *])
-AC_TYPE_UMODE_T
 AC_MANUAL_FORMAT
 AC_HAVE_LIBURCU_ATOMIC64
 

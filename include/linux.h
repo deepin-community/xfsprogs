@@ -27,9 +27,7 @@
 #include <asm/types.h>
 #include <mntent.h>
 #include <fcntl.h>
-#if defined(HAVE_FALLOCATE)
 #include <linux/falloc.h>
-#endif
 #ifdef OVERRIDE_SYSTEM_FSXATTR
 # define fsxattr sys_fsxattr
 #endif
@@ -176,24 +174,6 @@ static inline void platform_mntent_close(struct mntent_cursor * cursor)
 	endmntent(cursor->mtabp);
 }
 
-#if defined(FALLOC_FL_ZERO_RANGE)
-static inline int
-platform_zero_range(
-	int		fd,
-	xfs_off_t	start,
-	size_t		len)
-{
-	int ret;
-
-	ret = fallocate(fd, FALLOC_FL_ZERO_RANGE, start, len);
-	if (!ret)
-		return 0;
-	return -errno;
-}
-#else
-#define platform_zero_range(fd, s, l)	(-EOPNOTSUPP)
-#endif
-
 /*
  * Use SIGKILL to simulate an immediate program crash, without a chance to run
  * atexit handlers.
@@ -251,13 +231,10 @@ struct fsxattr {
 #define FS_XFLAG_COWEXTSIZE	0x00010000	/* CoW extent size allocator hint */
 #endif
 
-#ifndef HAVE_MAP_SYNC
-#define MAP_SYNC 0
-#define MAP_SHARED_VALIDATE 0
-#else
-#include <asm-generic/mman.h>
-#include <asm-generic/mman-common.h>
-#endif /* HAVE_MAP_SYNC */
+/* Atomic Write */
+#ifndef RWF_ATOMIC
+#define RWF_ATOMIC	((__kernel_rwf_t)0x00000040)
+#endif
 
 /*
  * Reminder: anything added to this file will be compiled into downstream

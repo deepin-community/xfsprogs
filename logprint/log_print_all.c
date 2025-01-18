@@ -152,11 +152,11 @@ xlog_recover_print_buffer(
 				be32_to_cpu(agf->agf_seqno),
 				be32_to_cpu(agf->agf_length));
 			printf(_("		root BNO:%d  CNT:%d\n"),
-				be32_to_cpu(agf->agf_roots[XFS_BTNUM_BNOi]),
-				be32_to_cpu(agf->agf_roots[XFS_BTNUM_CNTi]));
+				be32_to_cpu(agf->agf_bno_root),
+				be32_to_cpu(agf->agf_cnt_root));
 			printf(_("		level BNO:%d  CNT:%d\n"),
-				be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNOi]),
-				be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNTi]));
+				be32_to_cpu(agf->agf_bno_level),
+				be32_to_cpu(agf->agf_cnt_level));
 			printf(_("		1st:%d  last:%d  cnt:%d  "
 				"freeblks:%d  longest:%d\n"),
 				be32_to_cpu(agf->agf_flfirst),
@@ -240,9 +240,21 @@ STATIC void
 xlog_recover_print_inode_core(
 	struct xfs_log_dinode	*di)
 {
+	xfs_extnum_t		nextents;
+	xfs_aextnum_t		anextents;
+
 	printf(_("	CORE inode:\n"));
 	if (!print_inode)
 		return;
+
+	if (di->di_flags2 & XFS_DIFLAG2_NREXT64) {
+		nextents = di->di_big_nextents;
+		anextents = di->di_big_anextents;
+	} else {
+		nextents = di->di_nextents;
+		anextents = di->di_anextents;
+	}
+
 	printf(_("		magic:%c%c  mode:0x%x  ver:%d  format:%d\n"),
 	       (di->di_magic>>8) & 0xff, di->di_magic & 0xff,
 	       di->di_mode, di->di_version, di->di_format);
@@ -255,9 +267,9 @@ xlog_recover_print_inode_core(
 			xlog_extract_dinode_ts(di->di_ctime));
 	printf(_("		flushiter:%d\n"), di->di_flushiter);
 	printf(_("		size:0x%llx  nblks:0x%llx  exsize:%d  "
-	     "nextents:%d  anextents:%d\n"), (unsigned long long)
+	     "nextents:%" PRIu64 "  anextents:%" PRIu32 "\n"), (unsigned long long)
 	       di->di_size, (unsigned long long)di->di_nblocks,
-	       di->di_extsize, di->di_nextents, (int)di->di_anextents);
+	       di->di_extsize, nextents, anextents);
 	printf(_("		forkoff:%d  dmevmask:0x%x  dmstate:%d  flags:0x%x  "
 	     "gen:%u\n"),
 	       (int)di->di_forkoff, di->di_dmevmask, (int)di->di_dmstate,
@@ -404,6 +416,12 @@ xlog_recover_print_logitem(
 	case XFS_LI_EFI:
 		xlog_recover_print_efi(item);
 		break;
+	case XFS_LI_ATTRD:
+		xlog_recover_print_attrd(item);
+		break;
+	case XFS_LI_ATTRI:
+		xlog_recover_print_attri(item);
+		break;
 	case XFS_LI_RUD:
 		xlog_recover_print_rud(item);
 		break;
@@ -421,6 +439,12 @@ xlog_recover_print_logitem(
 		break;
 	case XFS_LI_BUI:
 		xlog_recover_print_bui(item);
+		break;
+	case XFS_LI_XMD:
+		xlog_recover_print_xmd(item);
+		break;
+	case XFS_LI_XMI:
+		xlog_recover_print_xmi(item);
 		break;
 	case XFS_LI_DQUOT:
 		xlog_recover_print_dquot(item);
@@ -456,6 +480,12 @@ xlog_recover_print_item(
 	case XFS_LI_EFI:
 		printf("EFI");
 		break;
+	case XFS_LI_ATTRD:
+		printf("ATTRD");
+		break;
+	case XFS_LI_ATTRI:
+		printf("ATTRI");
+		break;
 	case XFS_LI_RUD:
 		printf("RUD");
 		break;
@@ -473,6 +503,12 @@ xlog_recover_print_item(
 		break;
 	case XFS_LI_BUI:
 		printf("BUI");
+		break;
+	case XFS_LI_XMD:
+		printf("XMD");
+		break;
+	case XFS_LI_XMI:
+		printf("XMI");
 		break;
 	case XFS_LI_DQUOT:
 		printf("DQ ");

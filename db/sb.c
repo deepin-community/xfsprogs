@@ -50,8 +50,8 @@ sb_init(void)
 	add_command(&version_cmd);
 }
 
-#define	OFF(f)	bitize(offsetof(xfs_sb_t, sb_ ## f))
-#define	SZC(f)	szcount(xfs_sb_t, sb_ ## f)
+#define	OFF(f)	bitize(offsetof(struct xfs_dsb, sb_ ## f))
+#define	SZC(f)	szcount(struct xfs_dsb, sb_ ## f)
 const field_t	sb_flds[] = {
 	{ "magicnum", FLDT_UINT32X, OI(OFF(magicnum)), C1, 0, TYP_NONE },
 	{ "blocksize", FLDT_UINT32D, OI(OFF(blocksize)), C1, 0, TYP_NONE },
@@ -220,22 +220,22 @@ sb_logcheck(void)
 	int		dirty;
 
 	if (mp->m_sb.sb_logstart) {
-		if (x.logdev && x.logdev != x.ddev) {
+		if (x.log.dev && x.log.dev != x.data.dev) {
 			dbprintf(_("aborting - external log specified for FS "
 				 "with an internal log\n"));
 			return 0;
 		}
 	} else {
-		if (!x.logdev || (x.logdev == x.ddev)) {
+		if (!x.log.dev || (x.log.dev == x.data.dev)) {
 			dbprintf(_("aborting - no external log specified for FS "
 				 "with an external log\n"));
 			return 0;
 		}
 	}
 
-	libxfs_buftarg_init(mp, x.ddev, x.logdev, x.rtdev);
+	libxfs_buftarg_init(mp, &x);
 
-	dirty = xlog_is_dirty(mp, mp->m_log, &x, 0);
+	dirty = xlog_is_dirty(mp, mp->m_log);
 	if (dirty == -1) {
 		dbprintf(_("ERROR: cannot find log head/tail, run xfs_repair\n"));
 		return 0;
@@ -374,7 +374,7 @@ uuid_f(
 
 	if (argc == 2) {	/* WRITE UUID */
 
-		if ((x.isreadonly & LIBXFS_ISREADONLY) || !expert_mode) {
+		if ((x.flags & LIBXFS_ISREADONLY) || !expert_mode) {
 			dbprintf(_("%s: not in expert mode, writing disabled\n"),
 				progname);
 			return 0;
@@ -452,10 +452,10 @@ uuid_f(
 			}
 		}
 		if (mp->m_sb.sb_logstart) {
-			if (x.logdev && x.logdev != x.ddev)
+			if (x.log.dev && x.log.dev != x.data.dev)
 				dbprintf(_("warning - external log specified "
 					 "for FS with an internal log\n"));
-		} else if (!x.logdev || (x.logdev == x.ddev)) {
+		} else if (!x.log.dev || (x.log.dev == x.data.dev)) {
 			dbprintf(_("warning - no external log specified "
 				 "for FS with an external log\n"));
 		}
@@ -542,7 +542,7 @@ label_f(
 
 	if (argc == 2) {	/* WRITE LABEL */
 
-		if ((x.isreadonly & LIBXFS_ISREADONLY) || !expert_mode) {
+		if ((x.flags & LIBXFS_ISREADONLY) || !expert_mode) {
 			dbprintf(_("%s: not in expert mode, writing disabled\n"),
 				progname);
 			return 0;
@@ -704,6 +704,12 @@ version_string(
 		strcat(s, ",BIGTIME");
 	if (xfs_has_needsrepair(mp))
 		strcat(s, ",NEEDSREPAIR");
+	if (xfs_has_large_extent_counts(mp))
+		strcat(s, ",NREXT64");
+	if (xfs_has_exchange_range(mp))
+		strcat(s, ",EXCHANGE");
+	if (xfs_has_parent(mp))
+		strcat(s, ",PARENT");
 	return s;
 }
 
@@ -725,7 +731,7 @@ version_f(
 
 	if (argc == 2) {	/* WRITE VERSION */
 
-		if ((x.isreadonly & LIBXFS_ISREADONLY) || !expert_mode) {
+		if ((x.flags & LIBXFS_ISREADONLY) || !expert_mode) {
 			dbprintf(_("%s: not in expert mode, writing disabled\n"),
 				progname);
 			return 0;

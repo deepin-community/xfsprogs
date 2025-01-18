@@ -116,7 +116,7 @@ openfile(
 	}
 
 	if (!geom || !platform_test_xfs_fd(fd))
-		return fd;
+		goto set_fspath;
 
 	if (flags & IO_PATH) {
 		/* Can't call ioctl() on O_PATH fds */
@@ -150,6 +150,7 @@ openfile(
 		}
 	}
 
+set_fspath:
 	if (fs_path) {
 		fsp = fs_table_lookup(path, FS_MOUNT_POINT);
 		if (!fsp)
@@ -337,14 +338,19 @@ open_f(
 	return 0;
 }
 
-static int
-close_f(
-	int		argc,
-	char		**argv)
+int
+closefile(void)
 {
 	size_t		length;
 	unsigned int	offset;
 
+	if (file->flags & IO_ATOMICUPDATE) {
+		fprintf(stderr,
+	_("%s: atomic update in progress, cannot close.\n"),
+			file->name);
+		exitcode = 1;
+		return 0;
+	}
 	if (close(file->fd) < 0) {
 		perror("close");
 		exitcode = 1;
@@ -370,7 +376,19 @@ close_f(
 		free(filetable);
 		file = filetable = NULL;
 	}
-	filelist_f();
+	return 0;
+}
+
+static int
+close_f(
+	int		argc,
+	char		**argv)
+{
+	int		ret;
+
+	ret = closefile();
+	if (!ret)
+		filelist_f();
 	return 0;
 }
 

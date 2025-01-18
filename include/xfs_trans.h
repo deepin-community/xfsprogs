@@ -16,6 +16,11 @@ struct xfs_buf_map;
  * Userspace Transaction interface
  */
 
+struct xfs_item_ops {
+	uint64_t (*iop_sort)(struct xfs_log_item *lip);
+	int (*iop_precommit)(struct xfs_trans *tp, struct xfs_log_item *lip);
+};
+
 typedef struct xfs_log_item {
 	struct list_head		li_trans;	/* transaction list */
 	xfs_lsn_t			li_lsn;		/* last on-disk lsn */
@@ -24,6 +29,7 @@ typedef struct xfs_log_item {
 	unsigned long			li_flags;	/* misc flags */
 	struct xfs_buf			*li_buf;	/* real buffer pointer */
 	struct list_head		li_bio_list;	/* buffer item list */
+	const struct xfs_item_ops	*li_ops;	/* function list */
 } xfs_log_item_t;
 
 #define XFS_LI_DIRTY	3	/* log item dirty in transaction */
@@ -32,6 +38,7 @@ struct xfs_inode_log_item {
 	xfs_log_item_t		ili_item;		/* common portion */
 	struct xfs_inode	*ili_inode;		/* inode pointer */
 	unsigned short		ili_lock_flags;		/* lock flags */
+	unsigned int		ili_dirty_flags;	/* dirty in current tx */
 	unsigned int		ili_last_fields;	/* fields when flushed*/
 	unsigned int		ili_fields;		/* fields to be logged */
 	unsigned int		ili_fsync_fields;	/* ignored by userspace */
@@ -66,7 +73,7 @@ typedef struct xfs_trans {
 	unsigned int		t_rtx_res;	/* # of rt extents resvd */
 	unsigned int		t_rtx_res_used;	/* # of resvd rt extents used */
 	unsigned int		t_flags;	/* misc flags */
-	xfs_fsblock_t		t_firstblock;	/* first block allocated */
+	xfs_agnumber_t		t_highest_agno;	/* highest AGF locked */
 	struct xfs_mount 	*t_mountp;	/* ptr to fs mount struct */
 	struct xfs_dquot_acct	*t_dqinfo;	/* acctg info for dquots */
 	long			t_icount_delta;	/* superblock icount change */
@@ -91,6 +98,8 @@ int	libxfs_trans_alloc_rollable(struct xfs_mount *mp, uint blocks,
 int	libxfs_trans_alloc_empty(struct xfs_mount *mp, struct xfs_trans **tpp);
 int	libxfs_trans_commit(struct xfs_trans *);
 void	libxfs_trans_cancel(struct xfs_trans *);
+int	libxfs_trans_reserve_more(struct xfs_trans *tp, uint blocks,
+			uint rtextents);
 
 /* cancel dfops associated with a transaction */
 void xfs_defer_cancel(struct xfs_trans *);
@@ -105,6 +114,7 @@ int	libxfs_trans_roll_inode (struct xfs_trans **, struct xfs_inode *);
 void	libxfs_trans_brelse(struct xfs_trans *, struct xfs_buf *);
 void	libxfs_trans_binval(struct xfs_trans *, struct xfs_buf *);
 void	libxfs_trans_bjoin(struct xfs_trans *, struct xfs_buf *);
+void	libxfs_trans_bdetach(struct xfs_trans *tp, struct xfs_buf *bp);
 void	libxfs_trans_bhold(struct xfs_trans *, struct xfs_buf *);
 void	libxfs_trans_bhold_release(struct xfs_trans *, struct xfs_buf *);
 void	libxfs_trans_dirty_buf(struct xfs_trans *, struct xfs_buf *);
@@ -151,10 +161,9 @@ libxfs_trans_read_buf(
 }
 
 #define xfs_log_item_in_current_chkpt(lip)	(false)
-#define xfs_trans_item_relog(lip, tp)		(NULL)
 
 /* Contorted mess to make gcc shut up about unused vars. */
-#define xlog_grant_push_threshold(log, need)    \
+#define xfs_ail_get_push_target(ail)    \
 		((log) == (log) ? NULLCOMMITLSN : NULLCOMMITLSN)
 
 /* from xfs_log.h */

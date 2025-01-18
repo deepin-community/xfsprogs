@@ -34,3 +34,5 @@ extern void		info_init(void);
 extern void		btheight_init(void);
 extern void		timelimit_init(void);
 extern void		namei_init(void);
+extern void		iunlink_init(void);
+extern void		bmapinflate_init(void);

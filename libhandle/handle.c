@@ -29,7 +29,6 @@ typedef union {
 } comarg_t;
 
 static int obj_to_handle(char *, int, unsigned int, comarg_t, void**, size_t*);
-static int handle_to_fsfd(void *, char **);
 static char *path_to_fspath(char *path);
 
 
@@ -203,8 +202,10 @@ handle_to_fshandle(
 	return 0;
 }
 
-static int
-handle_to_fsfd(void *hanp, char **path)
+int
+handle_to_fsfd(
+	void		*hanp,
+	char		**path)
 {
 	struct fdhash	*fdhp;
 
@@ -436,30 +437,15 @@ parentpaths_by_handle(
 	return -1;
 }
 
+/* Deprecated in kernel */
 int
 fssetdm_by_handle(
 	void		*hanp,
 	size_t		hlen,
 	struct fsdmidata *fsdmidata)
 {
-	int		fd;
-	char		*path;
-	xfs_fsop_setdm_handlereq_t dmhreq;
-
-	if ((fd = handle_to_fsfd(hanp, &path)) < 0)
-		return -1;
-
-	dmhreq.hreq.fd       = 0;
-	dmhreq.hreq.path     = NULL;
-	dmhreq.hreq.oflags   = O_LARGEFILE;
-	dmhreq.hreq.ihandle  = hanp;
-	dmhreq.hreq.ihandlen = hlen;
-	dmhreq.hreq.ohandle  = NULL;
-	dmhreq.hreq.ohandlen = NULL;
-
-	dmhreq.data = fsdmidata;
-
-	return xfsctl(path, fd, XFS_IOC_FSSETDM_BY_HANDLE, &dmhreq);
+	errno = EOPNOTSUPP;
+	return -1;
 }
 
 /*ARGSUSED1*/
