@@ -139,7 +139,8 @@ scan_lbtree(
 				int			isroot,
 				int			check_dups,
 				int			*dirty,
-				uint64_t		magic),
+				uint64_t		magic,
+				void			*priv),
 	int		type,
 	int		whichfork,
 	xfs_ino_t	ino,
@@ -150,6 +151,7 @@ scan_lbtree(
 	int		isroot,
 	int		check_dups,
 	uint64_t	magic,
+	void		*priv,
 	const struct xfs_buf_ops *ops)
 {
 	struct xfs_buf	*bp;
@@ -181,7 +183,7 @@ scan_lbtree(
 	err = (*func)(XFS_BUF_TO_BLOCK(bp), nlevels - 1,
 			type, whichfork, root, ino, tot, nex, blkmapp,
 			bm_cursor, isroot, check_dups, &dirty,
-			magic);
+			magic, priv);
 
 	ASSERT(dirty == 0 || (dirty && !no_modify));
 
@@ -210,7 +212,8 @@ scan_bmapbt(
 	int			isroot,
 	int			check_dups,
 	int			*dirty,
-	uint64_t		magic)
+	uint64_t		magic,
+	void			*priv)
 {
 	int			i;
 	int			err;
@@ -224,6 +227,7 @@ scan_bmapbt(
 	xfs_agnumber_t		agno;
 	xfs_agblock_t		agbno;
 	int			state;
+	bool			zap_metadata = priv != NULL;
 
 	/*
 	 * unlike the ag freeblock btrees, if anything looks wrong
@@ -336,7 +340,7 @@ _("bad back (left) sibling pointer (saw %llu should be NULL (0))\n"
 		agno = XFS_FSB_TO_AGNO(mp, bno);
 		agbno = XFS_FSB_TO_AGBNO(mp, bno);
 
-		pthread_mutex_lock(&ag_locks[agno].lock);
+		lock_ag(agno);
 		state = get_bmap(agno, agbno);
 		switch (state) {
 		case XR_E_INUSE1:
@@ -349,7 +353,20 @@ _("bad back (left) sibling pointer (saw %llu should be NULL (0))\n"
 		case XR_E_UNKNOWN:
 		case XR_E_FREE1:
 		case XR_E_FREE:
-			set_bmap(agno, agbno, XR_E_INUSE);
+			set_bmap(agno, agbno, zap_metadata ? XR_E_METADATA :
+							     XR_E_INUSE);
+			break;
+		case XR_E_METADATA:
+			/*
+			 * bmbt block already claimed by a metadata file.  We
+			 * always reconstruct the entire metadata tree, so if
+			 * this is a regular file we mark it owned by the file.
+			 */
+			do_warn(
+_("inode 0x%" PRIx64 "bmap block 0x%" PRIx64 " claimed by metadata file\n"),
+				ino, bno);
+			if (!zap_metadata)
+				set_bmap(agno, agbno, XR_E_INUSE);
 			break;
 		case XR_E_FS_MAP:
 		case XR_E_INUSE:
@@ -361,7 +378,8 @@ _("bad back (left) sibling pointer (saw %llu should be NULL (0))\n"
 			 * we made it here, the block probably
 			 * contains btree data.
 			 */
-			set_bmap(agno, agbno, XR_E_MULT);
+			if (!zap_metadata)
+				set_bmap(agno, agbno, XR_E_MULT);
 			do_warn(
 _("inode 0x%" PRIx64 "bmap block 0x%" PRIx64 " claimed, state is %d\n"),
 				ino, bno, state);
@@ -389,7 +407,7 @@ _("bad state %d, inode %" PRIu64 " bmap block 0x%" PRIx64 "\n"),
 				state, ino, bno);
 			break;
 		}
-		pthread_mutex_unlock(&ag_locks[agno].lock);
+		unlock_ag(agno);
 	} else {
 		if (search_dup_extent(XFS_FSB_TO_AGNO(mp, bno),
 				XFS_FSB_TO_AGBNO(mp, bno),
@@ -400,11 +418,11 @@ _("bad state %d, inode %" PRIu64 " bmap block 0x%" PRIx64 "\n"),
 	numrecs = be16_to_cpu(block->bb_numrecs);
 
 	/* Record BMBT blocks in the reverse-mapping data. */
-	if (check_dups && collect_rmaps) {
+	if (check_dups && collect_rmaps && !zap_metadata) {
 		agno = XFS_FSB_TO_AGNO(mp, bno);
-		pthread_mutex_lock(&ag_locks[agno].lock);
+		lock_ag(agno);
 		rmap_add_bmbt_rec(mp, ino, whichfork, bno);
-		pthread_mutex_unlock(&ag_locks[agno].lock);
+		unlock_ag(agno);
 	}
 
 	if (level == 0) {
@@ -426,7 +444,8 @@ _("inode %" PRIu64 " bad # of bmap records (%" PRIu64 ", min - %u, max - %u)\n")
 		if (check_dups == 0)  {
 			err = process_bmbt_reclist(mp, rp, &numrecs, type, ino,
 						   tot, blkmapp, &first_key,
-						   &last_key, whichfork);
+						   &last_key, whichfork,
+						   zap_metadata);
 			if (err)
 				return 1;
 
@@ -456,7 +475,7 @@ _("out-of-order bmap key (file offset) in inode %" PRIu64 ", %s fork, fsbno %" P
 			return 0;
 		} else {
 			return scan_bmbt_reclist(mp, rp, &numrecs, type, ino,
-						 tot, whichfork);
+					tot, whichfork, zap_metadata);
 		}
 	}
 	if (numrecs > mp->m_bmap_dmxr[1] || (isroot == 0 && numrecs <
@@ -486,7 +505,7 @@ _("bad bmap btree ptr 0x%llx in ino %" PRIu64 "\n"),
 
 		err = scan_lbtree(be64_to_cpu(pp[i]), level, scan_bmapbt,
 				type, whichfork, ino, tot, nex, blkmapp,
-				bm_cursor, 0, check_dups, magic,
+				bm_cursor, 0, check_dups, magic, priv,
 				&xfs_bmbt_buf_ops);
 		if (err)
 			return(1);
@@ -705,10 +724,11 @@ _("%s freespace btree block claimed (state %d), agno %d, bno %d, suspect %d\n"),
 			}
 
 			for ( ; b < end; b += blen)  {
-				state = get_bmap_ext(agno, b, end, &blen);
+				state = get_bmap_ext(agno, b, end, &blen, false);
 				switch (state) {
 				case XR_E_UNKNOWN:
-					set_bmap_ext(agno, b, blen, XR_E_FREE1);
+					set_bmap_ext(agno, b, blen, XR_E_FREE1,
+							false);
 					break;
 				case XR_E_FREE1:
 					/*
@@ -718,7 +738,7 @@ _("%s freespace btree block claimed (state %d), agno %d, bno %d, suspect %d\n"),
 					if (magic == XFS_ABTC_MAGIC ||
 					    magic == XFS_ABTC_CRC_MAGIC) {
 						set_bmap_ext(agno, b, blen,
-							     XR_E_FREE);
+							     XR_E_FREE, false);
 						break;
 					}
 					fallthrough;
@@ -822,29 +842,35 @@ process_rmap_rec(
 		switch (owner) {
 		case XFS_RMAP_OWN_FS:
 		case XFS_RMAP_OWN_LOG:
-			set_bmap_ext(agno, b, blen, XR_E_INUSE_FS1);
+			set_bmap_ext(agno, b, blen, XR_E_INUSE_FS1, false);
 			break;
 		case XFS_RMAP_OWN_AG:
 		case XFS_RMAP_OWN_INOBT:
-			set_bmap_ext(agno, b, blen, XR_E_FS_MAP1);
+			set_bmap_ext(agno, b, blen, XR_E_FS_MAP1, false);
 			break;
 		case XFS_RMAP_OWN_INODES:
-			set_bmap_ext(agno, b, blen, XR_E_INO1);
+			set_bmap_ext(agno, b, blen, XR_E_INO1, false);
 			break;
 		case XFS_RMAP_OWN_REFC:
-			set_bmap_ext(agno, b, blen, XR_E_REFC);
+			set_bmap_ext(agno, b, blen, XR_E_REFC, false);
 			break;
 		case XFS_RMAP_OWN_COW:
-			set_bmap_ext(agno, b, blen, XR_E_COW);
+			set_bmap_ext(agno, b, blen, XR_E_COW, false);
 			break;
 		case XFS_RMAP_OWN_NULL:
 			/* still unknown */
 			break;
 		default:
 			/* file data */
-			set_bmap_ext(agno, b, blen, XR_E_INUSE1);
+			set_bmap_ext(agno, b, blen, XR_E_INUSE1, false);
 			break;
 		}
+		break;
+	case XR_E_METADATA:
+		do_warn(
+_("Metadata file block (%d,%d-%d) mismatch in %s tree, state - %d,%" PRIx64 "\n"),
+			agno, b, b + blen - 1,
+			name, state, owner);
 		break;
 	case XR_E_INUSE_FS:
 		if (owner == XFS_RMAP_OWN_FS ||
@@ -1182,7 +1208,8 @@ advance:
 
 			/* Check for block owner collisions. */
 			for ( ; b < end; b += blen)  {
-				state = get_bmap_ext(agno, b, end, &blen);
+				state = get_bmap_ext(agno, b, end, &blen,
+						false);
 				process_rmap_rec(mp, agno, b, end, blen, owner,
 						state, name);
 			}
@@ -1458,14 +1485,16 @@ _("leftover CoW extent has invalid startblock in record %u of %s btree block %u/
 				xfs_extlen_t	cnr;
 
 				for (c = agb; c < end; c += cnr) {
-					state = get_bmap_ext(agno, c, end, &cnr);
+					state = get_bmap_ext(agno, c, end, &cnr,
+							false);
 					switch (state) {
 					case XR_E_UNKNOWN:
 					case XR_E_COW:
 						do_warn(
 _("leftover CoW extent (%u/%u) len %u\n"),
 						agno, c, cnr);
-						set_bmap_ext(agno, c, cnr, XR_E_FREE);
+						set_bmap_ext(agno, c, cnr,
+							XR_E_FREE, false);
 						break;
 					default:
 						do_warn(

@@ -25,6 +25,7 @@ static int	inode_a_offset(void *obj, int startoff, int idx);
 static int	inode_a_sfattr_count(void *obj, int startoff);
 static int	inode_core_nlinkv2_count(void *obj, int startoff);
 static int	inode_core_onlink_count(void *obj, int startoff);
+static int	inode_core_metatype_count(void *obj, int startoff);
 static int	inode_core_projid_count(void *obj, int startoff);
 static int	inode_core_nlinkv1_count(void *obj, int startoff);
 static int	inode_core_v3_pad_count(void *obj, int startoff);
@@ -90,10 +91,12 @@ const field_t	inode_core_flds[] = {
 	{ "mode", FLDT_UINT16O, OI(COFF(mode)), C1, 0, TYP_NONE },
 	{ "version", FLDT_INT8D, OI(COFF(version)), C1, 0, TYP_NONE },
 	{ "format", FLDT_DINODE_FMT, OI(COFF(format)), C1, 0, TYP_NONE },
-	{ "nlinkv1", FLDT_UINT16D, OI(COFF(onlink)), inode_core_nlinkv1_count,
+	{ "nlinkv1", FLDT_UINT16D, OI(COFF(metatype)), inode_core_nlinkv1_count,
 	  FLD_COUNT, TYP_NONE },
-	{ "onlink", FLDT_UINT16D, OI(COFF(onlink)), inode_core_onlink_count,
+	{ "onlink", FLDT_UINT16D, OI(COFF(metatype)), inode_core_onlink_count,
 	  FLD_COUNT, TYP_NONE },
+	{ "metatype", FLDT_DINODE_METATYPE, OI(COFF(metatype)),
+	  inode_core_metatype_count, FLD_COUNT, TYP_NONE },
 	{ "uid", FLDT_UINT32D, OI(COFF(uid)), C1, 0, TYP_NONE },
 	{ "gid", FLDT_UINT32D, OI(COFF(gid)), C1, 0, TYP_NONE },
 	{ "nlinkv2", FLDT_UINT32D, OI(COFF(nlink)), inode_core_nlinkv2_count,
@@ -207,6 +210,9 @@ const field_t	inode_v3_flds[] = {
 	{ "nrext64", FLDT_UINT1,
 	  OI(COFF(flags2) + bitsz(uint64_t) - XFS_DIFLAG2_NREXT64_BIT - 1), C1,
 	  0, TYP_NONE },
+	{ "metadata", FLDT_UINT1,
+	  OI(COFF(flags2) + bitsz(uint64_t) - XFS_DIFLAG2_METADATA_BIT-1), C1,
+	  0, TYP_NONE },
 	{ NULL }
 };
 
@@ -244,6 +250,37 @@ static const char	*dinode_fmt_name[] =
 static const int	dinode_fmt_name_size =
 	sizeof(dinode_fmt_name) / sizeof(dinode_fmt_name[0]);
 
+static int
+fp_enum_fmt(
+	void			*obj,
+	int			bit,
+	int			count,
+	char			*fmtstr,
+	int			size,
+	int			arg,
+	int			base,
+	int			array,
+	const char		**names,
+	unsigned int		nr_names)
+{
+	int			bitpos;
+	int			f;
+	int			i;
+
+	for (i = 0, bitpos = bit; i < count; i++, bitpos += size) {
+		f = getbitval(obj, bitpos, size, BVUNSIGNED);
+		if (array)
+			dbprintf("%d:", i + base);
+		if (f < 0 || f >= nr_names)
+			dbprintf("%d", f);
+		else
+			dbprintf("%d (%s)", f, names[f]);
+		if (i < count - 1)
+			dbprintf(" ");
+	}
+	return 1;
+}
+
 /*ARGSUSED*/
 int
 fp_dinode_fmt(
@@ -256,22 +293,29 @@ fp_dinode_fmt(
 	int			base,
 	int			array)
 {
-	int			bitpos;
-	enum xfs_dinode_fmt	f;
-	int			i;
+	return fp_enum_fmt(obj, bit, count, fmtstr, size, arg, base, array,
+			dinode_fmt_name, dinode_fmt_name_size);
+}
 
-	for (i = 0, bitpos = bit; i < count; i++, bitpos += size) {
-		f = (enum xfs_dinode_fmt)getbitval(obj, bitpos, size, BVUNSIGNED);
-		if (array)
-			dbprintf("%d:", i + base);
-		if (f < 0 || f >= dinode_fmt_name_size)
-			dbprintf("%d", (int)f);
-		else
-			dbprintf("%d (%s)", (int)f, dinode_fmt_name[(int)f]);
-		if (i < count - 1)
-			dbprintf(" ");
-	}
-	return 1;
+static const char	*metatype_name[] =
+	{ "unknown", "dir", "usrquota", "grpquota", "prjquota", "rtbitmap",
+	  "rtsummary"
+	};
+static const int	metatype_name_size = ARRAY_SIZE(metatype_name);
+
+int
+fp_metatype(
+	void			*obj,
+	int			bit,
+	int			count,
+	char			*fmtstr,
+	int			size,
+	int			arg,
+	int			base,
+	int			array)
+{
+	return fp_enum_fmt(obj, bit, count, fmtstr, size, arg, base, array,
+			metatype_name, metatype_name_size);
 }
 
 static int
@@ -411,7 +455,29 @@ inode_core_onlink_count(
 	ASSERT(startoff == 0);
 	ASSERT(obj == iocur_top->data);
 	dic = obj;
-	return dic->di_version >= 2;
+	if (dic->di_version < 2)
+		return 0;
+	if (dic->di_flags2 & cpu_to_be64(XFS_DIFLAG2_METADATA))
+		return 0;
+	return 1;
+}
+
+static int
+inode_core_metatype_count(
+	void			*obj,
+	int			startoff)
+{
+	struct xfs_dinode	*dic;
+
+	ASSERT(startoff == 0);
+	ASSERT(obj == iocur_top->data);
+	dic = obj;
+
+	if (dic->di_version < 3)
+		return 0;
+	if (dic->di_flags2 & cpu_to_be64(XFS_DIFLAG2_METADATA))
+		return 1;
+	return 0;
 }
 
 static int
@@ -639,16 +705,34 @@ inode_next_type(void)
 	case S_IFLNK:
 		return TYP_SYMLINK;
 	case S_IFREG:
-		if (iocur_top->ino == mp->m_sb.sb_rbmino)
-			return TYP_RTBITMAP;
-		else if (iocur_top->ino == mp->m_sb.sb_rsumino)
-			return TYP_RTSUMMARY;
-		else if (iocur_top->ino == mp->m_sb.sb_uquotino ||
-			 iocur_top->ino == mp->m_sb.sb_gquotino ||
-			 iocur_top->ino == mp->m_sb.sb_pquotino)
+		if (xfs_has_rtgroups(mp)) {
+			struct xfs_dinode	*dic = iocur_top->data;
+
+			switch (be16_to_cpu(dic->di_metatype)) {
+			case XFS_METAFILE_USRQUOTA:
+			case XFS_METAFILE_GRPQUOTA:
+			case XFS_METAFILE_PRJQUOTA:
+				return TYP_DQBLK;
+			case XFS_METAFILE_RTBITMAP:
+				return TYP_RGBITMAP;
+			case XFS_METAFILE_RTSUMMARY:
+				return TYP_RGSUMMARY;
+			default:
+				return TYP_DATA;
+			}
+		} else {
+			if (iocur_top->ino == mp->m_sb.sb_rbmino)
+				return TYP_RTBITMAP;
+			if (iocur_top->ino == mp->m_sb.sb_rsumino)
+				return TYP_RTSUMMARY;
+		}
+
+		if (iocur_top->ino == mp->m_sb.sb_uquotino ||
+		    iocur_top->ino == mp->m_sb.sb_gquotino ||
+		    iocur_top->ino == mp->m_sb.sb_pquotino)
 			return TYP_DQBLK;
-		else
-			return TYP_DATA;
+
+		return TYP_DATA;
 	default:
 		return TYP_NONE;
 	}

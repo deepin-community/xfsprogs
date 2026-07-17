@@ -246,6 +246,7 @@ dblock_f(
 	int		nb;
 	xfs_extnum_t	nex;
 	char		*p;
+	bool		isrt;
 	typnm_t		type;
 
 	bno = (xfs_fileoff_t)strtoull(argv[1], &p, 0);
@@ -255,6 +256,7 @@ dblock_f(
 	}
 	push_cur();
 	set_cur_inode(iocur_top->ino);
+	isrt = is_rtfile(iocur_top->data);
 	type = inode_next_type();
 	pop_cur();
 	if (type == TYP_NONE) {
@@ -273,7 +275,7 @@ dblock_f(
 	ASSERT(typtab[type].typnm == type);
 	if (nex > 1)
 		make_bbmap(&bbmap, nex, bmp);
-	if (is_rtfile(iocur_top->data))
+	if (isrt)
 		set_rt_cur(&typtab[type], xfs_rtb_to_daddr(mp, dfsbno),
 				nb * blkbb, DB_RING_ADD,
 				nex > 1 ? &bbmap : NULL);
@@ -367,10 +369,23 @@ rtblock_f(
 		dbprintf(_("bad rtblock %s\n"), argv[1]);
 		return 0;
 	}
-	if (rtbno >= mp->m_sb.sb_rblocks) {
-		dbprintf(_("bad rtblock %s\n"), argv[1]);
-		return 0;
+
+	if (xfs_has_rtgroups(mp)) {
+		xfs_rgnumber_t	rgno = xfs_rtb_to_rgno(mp, rtbno);
+		xfs_rgblock_t	rgbno = xfs_rtb_to_rgbno(mp, rtbno);
+
+		if (rgno >= mp->m_sb.sb_rgcount ||
+		    rgbno >= mp->m_sb.sb_rgextents * mp->m_sb.sb_rextsize) {
+			dbprintf(_("bad rtblock %s\n"), argv[1]);
+			return 0;
+		}
+	} else {
+		if (rtbno >= mp->m_sb.sb_rblocks) {
+			dbprintf(_("bad rtblock %s\n"), argv[1]);
+			return 0;
+		}
 	}
+
 	ASSERT(typtab[TYP_DATA].typnm == TYP_DATA);
 	set_rt_cur(&typtab[TYP_DATA], xfs_rtb_to_daddr(mp, rtbno), blkbb,
 			DB_RING_ADD, NULL);
@@ -392,14 +407,17 @@ rtextent_help(void)
 /*
  * Move the cursor to a specific location on the realtime block device given
  * a linear address in units of realtime extents.
+ *
+ * NOTE: The user interface assumes a global RT extent number, while the
+ * in-kernel rtx is per-RTG now, thus the odd conversions here.
  */
 static int
 rtextent_f(
 	int		argc,
 	char		**argv)
 {
-	xfs_rtblock_t	rtbno;
-	xfs_rtxnum_t	rtx;
+	uint64_t	rfsbno;
+	uint64_t	rtx;
 	char		*p;
 
 	if (argc == 1) {
@@ -408,9 +426,9 @@ rtextent_f(
 			return 0;
 		}
 
-		rtbno = xfs_daddr_to_rtb(mp, iocur_top->off >> BBSHIFT);
+		rfsbno = XFS_BB_TO_FSB(mp, iocur_top->off >> BBSHIFT);
 		dbprintf(_("current rtextent is %lld\n"),
-				xfs_rtb_to_rtx(mp, rtbno));
+				xfs_blen_to_rtbxlen(mp, rfsbno));
 		return 0;
 	}
 	rtx = strtoull(argv[1], &p, 0);
@@ -423,9 +441,9 @@ rtextent_f(
 		return 0;
 	}
 
-	rtbno = xfs_rtx_to_rtb(mp, rtx);
+	rfsbno = xfs_rtbxlen_to_blen(mp, rtx);
 	ASSERT(typtab[TYP_DATA].typnm == TYP_DATA);
-	set_rt_cur(&typtab[TYP_DATA], xfs_rtb_to_daddr(mp, rtbno),
+	set_rt_cur(&typtab[TYP_DATA], XFS_FSB_TO_BB(mp, rfsbno),
 			mp->m_sb.sb_rextsize * blkbb, DB_RING_ADD, NULL);
 	return 0;
 }

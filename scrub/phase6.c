@@ -44,6 +44,9 @@ struct media_verify_state {
 	struct read_verify_pool	*rvp_realtime;
 	struct bitmap		*d_bad;		/* bytes */
 	struct bitmap		*r_bad;		/* bytes */
+	bool			d_trunc:1;
+	bool			r_trunc:1;
+	bool			l_trunc:1;
 };
 
 /* Find the fd for a given device identifier. */
@@ -492,7 +495,7 @@ report_ioerr(
 	uint64_t			length,
 	void				*arg)
 {
-	struct fsmap			keys[2];
+	struct fsmap			keys[2] = { };
 	struct ioerr_filerange		fr = {
 		.physical		= start,
 		.length			= length,
@@ -503,14 +506,13 @@ report_ioerr(
 	dev = disk_to_dev(dioerr->ctx, dioerr->disk);
 
 	/* Go figure out which blocks are bad from the fsmap. */
-	memset(keys, 0, sizeof(struct fsmap) * 2);
-	keys->fmr_device = dev;
-	keys->fmr_physical = start;
-	(keys + 1)->fmr_device = dev;
-	(keys + 1)->fmr_physical = start + length - 1;
-	(keys + 1)->fmr_owner = ULLONG_MAX;
-	(keys + 1)->fmr_offset = ULLONG_MAX;
-	(keys + 1)->fmr_flags = UINT_MAX;
+	keys[0].fmr_device = dev;
+	keys[0].fmr_physical = start;
+	keys[1].fmr_device = dev;
+	keys[1].fmr_physical = start + length - 1;
+	keys[1].fmr_owner = ULLONG_MAX;
+	keys[1].fmr_offset = ULLONG_MAX;
+	keys[1].fmr_flags = UINT_MAX;
 	return -scrub_iterate_fsmap(dioerr->ctx, keys, report_ioerr_fsmap,
 			&fr);
 }
@@ -544,6 +546,13 @@ report_all_media_errors(
 {
 	int				ret;
 
+	if (vs->d_trunc)
+		str_corrupt(ctx, ctx->mntpoint, _("data device truncated"));
+	if (vs->l_trunc)
+		str_corrupt(ctx, ctx->mntpoint, _("log device truncated"));
+	if (vs->r_trunc)
+		str_corrupt(ctx, ctx->mntpoint, _("rt device truncated"));
+
 	ret = report_disk_ioerrs(ctx, ctx->datadev, vs);
 	if (ret) {
 		str_liberror(ctx, ret, _("walking datadev io errors"));
@@ -568,7 +577,7 @@ report_all_media_errors(
 	}
 
 	/* Scan for unlinked files. */
-	return scrub_scan_all_inodes(ctx, report_inode_loss, vs);
+	return scrub_scan_all_inodes(ctx, report_inode_loss, 0, vs);
 }
 
 /* Schedule a read-verify of a (data block) extent. */
@@ -662,6 +671,18 @@ remember_ioerr(
 	struct media_verify_state	*vs = arg;
 	struct bitmap			*tree;
 	int				ret;
+
+	if (!length) {
+		dev_t			dev = disk_to_dev(ctx, disk);
+
+		if (dev == ctx->fsinfo.fs_datadev)
+			vs->d_trunc = true;
+		else if (dev == ctx->fsinfo.fs_rtdev)
+			vs->r_trunc = true;
+		else if (dev == ctx->fsinfo.fs_logdev)
+			vs->l_trunc = true;
+		return;
+	}
 
 	tree = bitmap_for_disk(ctx, disk, vs);
 	if (!tree) {

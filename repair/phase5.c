@@ -72,7 +72,7 @@ mk_incore_fstree(
 	 * largest extent.
 	 */
 	for (agbno = 0; agbno < ag_end; agbno += blen) {
-		bstate = get_bmap_ext(agno, agbno, ag_end, &blen);
+		bstate = get_bmap_ext(agno, agbno, ag_end, &blen, false);
 		if (bstate < XR_E_INUSE)  {
 			free_blocks += blen;
 			if (in_extent == 0)  {
@@ -419,13 +419,18 @@ static void
 keep_fsinos(xfs_mount_t *mp)
 {
 	ino_tree_node_t		*irec;
-	int			i;
+	unsigned int		inuse = xfs_rootrec_inodes_inuse(mp), i;
 
 	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, mp->m_sb.sb_rootino),
 			XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rootino));
 
-	for (i = 0; i < 3; i++)
+	for (i = 0; i < inuse; i++) {
 		set_inode_used(irec, i);
+
+		/* Everything after the root dir is metadata */
+		if (i)
+			set_inode_is_meta(irec, i);
+	}
 }
 
 static void
@@ -441,7 +446,7 @@ phase5_func(
 	struct bt_rebuild	btr_fino;
 	struct bt_rebuild	btr_rmap;
 	struct bt_rebuild	btr_refc;
-	xfs_agnumber_t		agno = pag->pag_agno;
+	xfs_agnumber_t		agno = pag_agno(pag);
 	int			extra_blocks = 0;
 	uint			num_freeblocks;
 	xfs_agblock_t		num_extents;
@@ -622,8 +627,7 @@ void
 check_rtmetadata(
 	struct xfs_mount	*mp)
 {
-	rtinit(mp);
-	generate_rtinfo(mp, btmcompute, sumcompute);
+	generate_rtinfo(mp);
 	check_rtbitmap(mp);
 	check_rtsummary(mp);
 }
@@ -632,7 +636,7 @@ void
 phase5(xfs_mount_t *mp)
 {
 	struct bitmap		*lost_blocks = NULL;
-	struct xfs_perag	*pag;
+	struct xfs_perag	*pag = NULL;
 	xfs_agnumber_t		agno;
 	int			error;
 
@@ -679,7 +683,7 @@ phase5(xfs_mount_t *mp)
 	if (error)
 		do_error(_("cannot alloc lost block bitmap\n"));
 
-	for_each_perag(mp, agno, pag)
+	while ((pag = xfs_perag_next(mp, pag)))
 		phase5_func(mp, pag, lost_blocks);
 
 	print_final_rpt();

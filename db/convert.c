@@ -8,7 +8,6 @@
 #include "command.h"
 #include "output.h"
 #include "init.h"
-#include "block.h"
 
 #define	M(A)	(1 << CT_ ## A)
 #define	agblock_to_bytes(x)	\
@@ -27,14 +26,29 @@
 	 agino_to_bytes(XFS_INO_TO_AGINO(mp, (x))))
 #define	inoidx_to_bytes(x)	\
 	((uint64_t)(x) << mp->m_sb.sb_inodelog)
-#define rtblock_to_bytes(x)	\
+#define	rtblock_to_bytes(x)	\
+	(xfs_rtb_to_daddr(mp, (x)) << BBSHIFT)
+#define	rtx_to_bytes(x)		\
+	(((uint64_t)(x) * mp->m_sb.sb_rextsize) << mp->m_sb.sb_blocklog)
+#define	rbmblock_to_bytes(x)	\
+	rtx_to_bytes(xfs_rbmblock_to_rtx(mp, (x)))
+#define	rbmword_to_bytes(x)	\
+	rtx_to_bytes((uint64_t)(x) << XFS_NBWORDLOG)
+#define	rgblock_to_bytes(x)	\
 	((uint64_t)(x) << mp->m_sb.sb_blocklog)
-#define rtx_to_rtblock(x)	\
-	((uint64_t)(x) * mp->m_sb.sb_rextsize)
-#define rbmblock_to_bytes(x)	\
-	rtblock_to_bytes(rtx_to_rtblock(xfs_rbmblock_to_rtx(mp, (uint64_t)x)))
-#define rbmword_to_bytes(x)	\
-	rtblock_to_bytes(rtx_to_rtblock((uint64_t)(x) << XFS_NBWORDLOG))
+#define	rgnumber_to_bytes(x)	\
+	rgblock_to_bytes((uint64_t)(x) * mp->m_groups[XG_TYPE_RTG].blocks)
+
+static inline xfs_rgnumber_t
+xfs_daddr_to_rgno(
+	struct xfs_mount	*mp,
+	xfs_daddr_t		daddr)
+{
+	if (!xfs_has_rtgroups(mp))
+		return 0;
+
+	return XFS_BB_TO_FSBT(mp, daddr) / mp->m_groups[XG_TYPE_RTG].blocks;
+}
 
 typedef enum {
 	CT_NONE = -1,
@@ -56,6 +70,8 @@ typedef enum {
 	CT_RSUMBLOCK,		/* block within rt summary */
 	CT_RSUMLOG,		/* log level for rtsummary computations */
 	CT_RSUMINFO,		/* info word within rt summary */
+	CT_RGBLOCK,		/* xfs_rgblock_t */
+	CT_RGNUMBER,		/* xfs_rgno_t */
 	NCTS
 } ctype_t;
 
@@ -81,6 +97,8 @@ typedef union {
 	xfs_fileoff_t	rbmblock;
 	unsigned int	rbmword;
 	xfs_fileoff_t	rsumblock;
+	xfs_rgnumber_t	rgnumber;
+	xfs_rgblock_t	rgblock;
 } cval_t;
 
 static uint64_t		bytevalue(ctype_t ctype, cval_t *val);
@@ -96,7 +114,7 @@ static const char	*agnumber_names[] = { "agnumber", "agno", NULL };
 static const char	*bboff_names[] = { "bboff", "daddroff", NULL };
 static const char	*blkoff_names[] = { "blkoff", "fsboff", "agboff",
 					    NULL };
-static const char	*rtblkoff_names[] = { "blkoff", "rtboff",
+static const char	*rtblkoff_names[] = { "blkoff", "rtboff", "rgboff",
 					    NULL };
 static const char	*byte_names[] = { "byte", "fsbyte", NULL };
 static const char	*daddr_names[] = { "daddr", "bb", NULL };
@@ -112,6 +130,8 @@ static const char	*rbmword_names[] = { "rbmword", "rbmw", NULL };
 static const char	*rsumblock_names[] = { "rsumblock", "rsmb", NULL };
 static const char	*rsumlog_names[] = { "rsumlog", "rsml", NULL };
 static const char	*rsumword_names[] = { "rsuminfo", "rsmi", NULL };
+static const char	*rgblock_names[] = { "rgblock", "rgbno", NULL };
+static const char	*rgnumber_names[] = { "rgnumber", "rgno", NULL };
 
 static int		rsuminfo;
 static int		rsumlog;
@@ -245,6 +265,22 @@ static const ctydesc_t	ctydescs_rt[NCTS] = {
 		.allowed = M(RSUMBLOCK),
 		.names   = rsumword_names,
 	},
+	[CT_RGBLOCK] = {
+		.allowed = M(RGNUMBER) |
+			   M(BBOFF) |
+			   M(BLKOFF) |
+			   M(RSUMLOG),
+		.names   = rgblock_names,
+	},
+	[CT_RGNUMBER] = {
+		.allowed = M(RGBLOCK) |
+			   M(BBOFF) |
+			   M(BLKOFF) |
+			   M(RSUMLOG) |
+			   M(RBMBLOCK) |
+			   M(RBMWORD),
+		.names   = rgnumber_names,
+	},
 };
 
 static const cmdinfo_t	convert_cmd =
@@ -317,7 +353,7 @@ bytevalue(ctype_t ctype, cval_t *val)
 	case CT_RTBLOCK:
 		return rtblock_to_bytes(val->rtblock);
 	case CT_RTX:
-		return rtblock_to_bytes(rtx_to_rtblock(val->rtx));
+		return rtx_to_bytes(val->rtx);
 	case CT_RBMBLOCK:
 		return rbmblock_to_bytes(val->rbmblock);
 	case CT_RBMWORD:
@@ -332,6 +368,10 @@ bytevalue(ctype_t ctype, cval_t *val)
 		 * value.
 		 */
 		return 0;
+	case CT_RGBLOCK:
+		return rgblock_to_bytes(val->rgblock);
+	case CT_RGNUMBER:
+		return rgnumber_to_bytes(val->rgnumber);
 	case CT_NONE:
 	case NCTS:
 		break;
@@ -438,6 +478,8 @@ convert_f(int argc, char **argv)
 	case CT_RSUMBLOCK:
 	case CT_RSUMLOG:
 	case CT_RSUMINFO:
+	case CT_RGBLOCK:
+	case CT_RGNUMBER:
 		/* shouldn't get here */
 		ASSERT(0);
 		break;
@@ -494,6 +536,43 @@ rt_daddr_to_rsuminfo(
 	rsumoff = xfs_rtsumoffs(mp, rsumlog, rbmblock);
 
 	return xfs_rtsumoffs_to_infoword(mp, rsumoff);
+}
+
+/* Translate an rt device disk address to be in units of realtime extents. */
+static inline uint64_t
+rt_daddr_to_rtx(
+	struct xfs_mount	*mp,
+	xfs_daddr_t		daddr)
+{
+	return XFS_BB_TO_FSBT(mp, daddr) / mp->m_sb.sb_rextsize;
+}
+
+/*
+ * Compute the offset of an rt device disk address from the start of an
+ * rtgroup and return the result in units of realtime extents.
+ */
+static inline uint64_t
+rt_daddr_to_rtgrtx(
+	struct xfs_mount	*mp,
+	xfs_daddr_t		daddr)
+{
+	uint64_t		rtx = rt_daddr_to_rtx(mp, daddr);
+
+	if (xfs_has_rtgroups(mp))
+		return rtx % mp->m_sb.sb_rgextents;
+
+	return rtx;
+}
+
+static inline xfs_rgblock_t
+rt_daddr_to_rgbno(
+	struct xfs_mount	*mp,
+	xfs_daddr_t		daddr)
+{
+	if (!xfs_has_rtgroups(mp))
+		return 0;
+
+	return XFS_BB_TO_FSBT(mp, daddr) % mp->m_groups[XG_TYPE_RTG].blocks;
 }
 
 static int
@@ -566,17 +645,15 @@ rtconvert_f(int argc, char **argv)
 		v = xfs_daddr_to_rtb(mp, v >> BBSHIFT);
 		break;
 	case CT_RTX:
-		v = xfs_daddr_to_rtb(mp, v >> BBSHIFT) / mp->m_sb.sb_rextsize;
+		v = rt_daddr_to_rtx(mp, v >> BBSHIFT);
 		break;
 	case CT_RBMBLOCK:
 		v = xfs_rtx_to_rbmblock(mp,
-				xfs_rtb_to_rtx(mp,
-					xfs_daddr_to_rtb(mp, v >> BBSHIFT)));
+				rt_daddr_to_rtgrtx(mp, v >> BBSHIFT));
 		break;
 	case CT_RBMWORD:
 		v = xfs_rtx_to_rbmword(mp,
-				xfs_rtb_to_rtx(mp,
-					xfs_daddr_to_rtb(mp, v >> BBSHIFT)));
+				rt_daddr_to_rtgrtx(mp, v >> BBSHIFT));
 		break;
 	case CT_RSUMBLOCK:
 		v = rt_daddr_to_rsumblock(mp, v);
@@ -587,6 +664,12 @@ rtconvert_f(int argc, char **argv)
 		break;
 	case CT_RSUMINFO:
 		v = rt_daddr_to_rsuminfo(mp, v);
+		break;
+	case CT_RGBLOCK:
+		v = rt_daddr_to_rgbno(mp, v >> BBSHIFT);
+		break;
+	case CT_RGNUMBER:
+		v = xfs_daddr_to_rgno(mp, v >> BBSHIFT);
 		break;
 	case CT_AGBLOCK:
 	case CT_AGINO:
@@ -679,6 +762,12 @@ getvalue(char *s, ctype_t ctype, cval_t *val)
 		break;
 	case CT_RSUMINFO:
 		rsuminfo = (unsigned int)v;
+		break;
+	case CT_RGBLOCK:
+		val->rgblock = (xfs_rgblock_t)v;
+		break;
+	case CT_RGNUMBER:
+		val->rgnumber = (xfs_rgnumber_t)v;
 		break;
 	case CT_NONE:
 	case NCTS:
