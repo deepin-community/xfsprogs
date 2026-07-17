@@ -28,6 +28,7 @@ copy_sb(xfs_sb_t *source, xfs_sb_t *dest)
 	xfs_ino_t	uquotino;
 	xfs_ino_t	gquotino;
 	xfs_ino_t	pquotino;
+	xfs_ino_t	metadirino;
 	uint16_t	versionnum;
 
 	rootino = dest->sb_rootino;
@@ -36,6 +37,7 @@ copy_sb(xfs_sb_t *source, xfs_sb_t *dest)
 	uquotino = dest->sb_uquotino;
 	gquotino = dest->sb_gquotino;
 	pquotino = dest->sb_pquotino;
+	metadirino = dest->sb_metadirino;
 
 	versionnum = dest->sb_versionnum;
 
@@ -47,6 +49,7 @@ copy_sb(xfs_sb_t *source, xfs_sb_t *dest)
 	dest->sb_uquotino = uquotino;
 	dest->sb_gquotino = gquotino;
 	dest->sb_pquotino = pquotino;
+	dest->sb_metadirino = metadirino;
 
 	dest->sb_versionnum = versionnum;
 
@@ -230,6 +233,9 @@ find_secondary_sb(xfs_sb_t *rsb)
         if (!retval)
                 retval = __find_secondary_sb(rsb, XFS_AG_MIN_BYTES, BSIZE);
 
+	if (retval && xfs_sb_version_hasmetadir(rsb))
+		do_warn(_("quota accounting and enforcement flags lost\n"));
+
 	return retval;
 }
 
@@ -306,6 +312,38 @@ verify_sb_loginfo(
 		return false;
 
 	return true;
+}
+
+static int
+verify_sb_rtgroups(
+	struct xfs_sb		*sbp)
+{
+	uint64_t		groups;
+
+	if (sbp->sb_rextsize == 0)
+		return XR_BAD_RT_GEO_DATA;
+
+	if (sbp->sb_rgextents > XFS_MAX_RGBLOCKS / sbp->sb_rextsize)
+		return XR_BAD_RT_GEO_DATA;
+
+	if (sbp->sb_rgextents < XFS_MIN_RGEXTENTS)
+		return XR_BAD_RT_GEO_DATA;
+
+	if (sbp->sb_rgcount > XFS_MAX_RGNUMBER)
+		return XR_BAD_RT_GEO_DATA;
+
+	groups = howmany_64(sbp->sb_rextents, sbp->sb_rgextents);
+	if (groups != sbp->sb_rgcount)
+		return XR_BAD_RT_GEO_DATA;
+
+	if (!(sbp->sb_features_incompat & XFS_SB_FEAT_INCOMPAT_EXCHRANGE))
+		return XR_BAD_RT_GEO_DATA;
+
+	if (sbp->sb_rgblklog != libxfs_compute_rgblklog(sbp->sb_rgextents,
+							sbp->sb_rextsize))
+		return XR_BAD_RT_GEO_DATA;
+
+	return 0;
 }
 
 /*
@@ -478,6 +516,15 @@ verify_sb(char *sb_buf, xfs_sb_t *sb, int is_primary_sb)
 	/* Directory block log */
 	if (sb->sb_blocklog + sb->sb_dirblklog > XFS_MAX_BLOCKSIZE_LOG)
 		return XR_BAD_DIR_SIZE_DATA;
+
+	if (xfs_sb_version_hasmetadir(sb)) {
+		if (memchr_inv(sb->sb_pad, 0, sizeof(sb->sb_pad)))
+			return XR_SB_GEO_MISMATCH;
+
+		ret = verify_sb_rtgroups(sb);
+		if (ret)
+			return ret;
+	}
 
 	return(XR_OK);
 }

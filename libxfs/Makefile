@@ -49,11 +49,14 @@ HFILES = \
 	xfs_dir2.h \
 	xfs_errortag.h \
 	xfs_exchmaps.h \
+	xfs_group.h \
 	xfs_ialloc.h \
 	xfs_ialloc_btree.h \
 	xfs_inode_buf.h \
 	xfs_inode_fork.h \
 	xfs_inode_util.h \
+	xfs_metadir.h \
+	xfs_metafile.h \
 	xfs_parent.h \
 	xfs_quota_defs.h \
 	xfs_refcount.h \
@@ -61,6 +64,7 @@ HFILES = \
 	xfs_rmap.h \
 	xfs_rmap_btree.h \
 	xfs_rtbitmap.h \
+	xfs_rtgroup.h \
 	xfs_sb.h \
 	xfs_shared.h \
 	xfs_trans_resv.h \
@@ -105,12 +109,15 @@ CFILES = buf_mem.c \
 	xfs_dir2_sf.c \
 	xfs_dquot_buf.c \
 	xfs_exchmaps.c \
+	xfs_group.c \
 	xfs_ialloc.c \
 	xfs_iext_tree.c \
 	xfs_inode_buf.c \
 	xfs_inode_fork.c \
 	xfs_inode_util.c \
 	xfs_ialloc_btree.c \
+	xfs_metadir.c \
+	xfs_metafile.c \
 	xfs_log_rlimit.c \
 	xfs_parent.c \
 	xfs_refcount.c \
@@ -118,6 +125,7 @@ CFILES = buf_mem.c \
 	xfs_rmap.c \
 	xfs_rmap_btree.c \
 	xfs_rtbitmap.c \
+	xfs_rtgroup.c \
 	xfs_sb.c \
 	xfs_symlink_remote.c \
 	xfs_trans_inode.c \

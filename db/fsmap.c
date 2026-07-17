@@ -46,7 +46,7 @@ fsmap(
 	struct xfs_rmap_irec	high = {0};
 	struct xfs_btree_cur	*bt_cur;
 	struct xfs_buf		*agbp;
-	struct xfs_perag	*pag;
+	struct xfs_perag	*pag = NULL;
 	int			error;
 
 	eofs = XFS_FSB_TO_BB(mp, mp->m_sb.sb_dblocks);
@@ -63,8 +63,8 @@ fsmap(
 	end_ag = XFS_FSB_TO_AGNO(mp, end_fsb);
 
 	info.nr = 0;
-	for_each_perag_range(mp, start_ag, end_ag, pag) {
-		if (pag->pag_agno == end_ag)
+	while ((pag = xfs_perag_next_range(mp, pag, start_ag, end_ag))) {
+		if (pag_agno(pag) == end_ag)
 			high.rm_startblock = XFS_FSB_TO_AGBNO(mp, end_fsb);
 
 		error = -libxfs_alloc_read_agf(pag, NULL, 0, &agbp);
@@ -82,7 +82,7 @@ fsmap(
 			return;
 		}
 
-		info.agno = pag->pag_agno;
+		info.agno = pag_agno(pag);
 		error = -libxfs_rmap_query_range(bt_cur, &low, &high,
 				fsmap_fn, &info);
 		if (error) {
@@ -97,7 +97,7 @@ fsmap(
 		libxfs_btree_del_cursor(bt_cur, XFS_BTREE_NOERROR);
 		libxfs_buf_relse(agbp);
 
-		if (pag->pag_agno == start_ag)
+		if (pag_agno(pag) == start_ag)
 			low.rm_startblock = 0;
 	}
 }

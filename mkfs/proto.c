@@ -6,6 +6,8 @@
 
 #include "libxfs.h"
 #include <sys/stat.h>
+#include <sys/xattr.h>
+#include <linux/xattr.h>
 #include "libfrog/convert.h"
 #include "proto.h"
 
@@ -16,7 +18,7 @@ static char *getstr(char **pp);
 static void fail(char *msg, int i);
 static struct xfs_trans * getres(struct xfs_mount *mp, uint blocks);
 static void rsvfile(xfs_mount_t *mp, xfs_inode_t *ip, long long len);
-static char *newregfile(char **pp, int *len);
+static int newregfile(char **pp, char **fname);
 static void rtinit(xfs_mount_t *mp);
 static long filesize(int fd);
 static int slashes_are_spaces;
@@ -203,7 +205,7 @@ rsvfile(
 	int		error;
 	xfs_trans_t	*tp;
 
-	error = -libxfs_alloc_file_space(ip, 0, llen, 1, 0);
+	error = -libxfs_alloc_file_space(ip, 0, llen, XFS_BMAPI_PREALLOC);
 
 	if (error) {
 		fail(_("error reserving space for a file"), error);
@@ -261,88 +263,208 @@ writesymlink(
 }
 
 static void
-writefile(
-	struct xfs_trans	*tp,
+writefile_range(
 	struct xfs_inode	*ip,
-	char			*buf,
-	int			len)
+	const char		*fname,
+	int			fd,
+	off_t			pos,
+	uint64_t		len)
 {
-	struct xfs_bmbt_irec	map;
-	struct xfs_mount	*mp;
-	struct xfs_buf		*bp;
-	xfs_daddr_t		d;
-	xfs_extlen_t		nb;
-	int			nmap;
+	static char		buf[131072];
 	int			error;
 
-	mp = ip->i_mount;
-	if (len > 0) {
-		int	bcount;
-
-		nb = XFS_B_TO_FSB(mp, len);
-		nmap = 1;
-		error = -libxfs_bmapi_write(tp, ip, 0, nb, 0, nb, &map, &nmap);
-		if (error == ENOSYS && XFS_IS_REALTIME_INODE(ip)) {
-			fprintf(stderr,
-	_("%s: creating realtime files from proto file not supported.\n"),
-					progname);
-			exit(1);
-		}
-		if (error) {
-			fail(_("error allocating space for a file"), error);
-		}
-		if (nmap != 1) {
-			fprintf(stderr,
-				_("%s: cannot allocate space for file\n"),
+	if (XFS_IS_REALTIME_INODE(ip)) {
+		fprintf(stderr,
+ _("%s: creating realtime files from proto file not supported.\n"),
 				progname);
-			exit(1);
-		}
-		d = XFS_FSB_TO_DADDR(mp, map.br_startblock);
-		error = -libxfs_trans_get_buf(NULL, mp->m_dev, d,
-				nb << mp->m_blkbb_log, 0, &bp);
-		if (error) {
-			fprintf(stderr,
-				_("%s: cannot allocate buffer for file\n"),
-				progname);
-			exit(1);
-		}
-		memmove(bp->b_addr, buf, len);
-		bcount = BBTOB(bp->b_length);
-		if (len < bcount)
-			memset((char *)bp->b_addr + len, 0, bcount - len);
-		libxfs_buf_mark_dirty(bp);
-		libxfs_buf_relse(bp);
-	}
-	ip->i_disk_size = len;
-}
-
-static char *
-newregfile(
-	char		**pp,
-	int		*len)
-{
-	char		*buf;
-	int		fd;
-	char		*fname;
-	long		size;
-
-	fname = getstr(pp);
-	if ((fd = open(fname, O_RDONLY)) < 0 || (size = filesize(fd)) < 0) {
-		fprintf(stderr, _("%s: cannot open %s: %s\n"),
-			progname, fname, strerror(errno));
 		exit(1);
 	}
-	if ((*len = (int)size)) {
-		buf = malloc(size);
-		if (read(fd, buf, size) < size) {
+
+	while (len > 0) {
+		ssize_t		read_len;
+
+		read_len = pread(fd, buf, min(len, sizeof(buf)), pos);
+		if (read_len < 0) {
 			fprintf(stderr, _("%s: read failed on %s: %s\n"),
-				progname, fname, strerror(errno));
+					progname, fname, strerror(errno));
 			exit(1);
 		}
-	} else
-		buf = NULL;
-	close(fd);
-	return buf;
+
+		error = -libxfs_alloc_file_space(ip, pos, read_len, 0);
+		if (error)
+			fail(_("error allocating space for a file"), error);
+
+		error = -libxfs_file_write(ip, buf, pos, read_len);
+		if (error)
+			fail(_("error writing file"), error);
+
+		pos += read_len;
+		len -= read_len;
+	}
+}
+
+static void
+writefile(
+	struct xfs_inode	*ip,
+	const char		*fname,
+	int			fd)
+{
+	struct xfs_trans	*tp;
+	struct xfs_mount	*mp = ip->i_mount;
+	struct stat		statbuf;
+	off_t			data_pos;
+	int			error;
+
+	/* do not try to read from non-regular files */
+	error = fstat(fd, &statbuf);
+	if (error < 0)
+		fail(_("unable to stat file to copyin"), errno);
+
+	if (!S_ISREG(statbuf.st_mode))
+		return;
+
+	data_pos = lseek(fd, 0, SEEK_DATA);
+	while (data_pos >= 0) {
+		off_t		hole_pos;
+
+		hole_pos = lseek(fd, data_pos, SEEK_HOLE);
+		if (hole_pos < 0) {
+			/* save error, break */
+			data_pos = hole_pos;
+			break;
+		}
+		if (hole_pos <= data_pos) {
+			/* shouldn't happen??? */
+			break;
+		}
+
+		writefile_range(ip, fname, fd, data_pos, hole_pos - data_pos);
+		data_pos = lseek(fd, hole_pos, SEEK_DATA);
+	}
+	if (data_pos < 0 && errno != ENXIO)
+		fail(_("error finding file data to import"), errno);
+
+	/* extend EOF only after writing all the file data */
+	error = -libxfs_trans_alloc_inode(ip, &M_RES(mp)->tr_ichange, 0, 0,
+			false, &tp);
+	if (error)
+		fail(_("error creating isize transaction"), error);
+
+	libxfs_trans_ijoin(tp, ip, 0);
+	ip->i_disk_size = statbuf.st_size;
+	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	error = -libxfs_trans_commit(tp);
+	if (error)
+		fail(_("error committing isize transaction"), error);
+}
+
+static void
+writeattr(
+	struct xfs_inode	*ip,
+	const char		*fname,
+	int			fd,
+	const char		*attrname,
+	char			*valuebuf,
+	size_t			valuelen)
+{
+	struct xfs_da_args	args = {
+		.dp		= ip,
+		.geo		= ip->i_mount->m_attr_geo,
+		.owner		= ip->i_ino,
+		.whichfork	= XFS_ATTR_FORK,
+		.op_flags	= XFS_DA_OP_OKNOENT,
+		.value		= valuebuf,
+	};
+	ssize_t			ret;
+	int			error;
+
+	ret = fgetxattr(fd, attrname, valuebuf, valuelen);
+	if (ret < 0) {
+		if (errno == EOPNOTSUPP)
+			return;
+		fail(_("error collecting xattr value"), errno);
+	}
+	if (ret == 0)
+		return;
+
+	if (!strncmp(attrname, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN)) {
+		args.name = (unsigned char *)attrname + XATTR_TRUSTED_PREFIX_LEN;
+		args.attr_filter = LIBXFS_ATTR_ROOT;
+	} else if (!strncmp(attrname, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN)) {
+		args.name = (unsigned char *)attrname + XATTR_SECURITY_PREFIX_LEN;
+		args.attr_filter = LIBXFS_ATTR_SECURE;
+	} else if (!strncmp(attrname, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN)) {
+		args.name = (unsigned char *)attrname + XATTR_USER_PREFIX_LEN;
+		args.attr_filter = 0;
+	} else {
+		args.name = (unsigned char *)attrname;
+		args.attr_filter = 0;
+	}
+	args.namelen = strlen((char *)args.name);
+
+	args.valuelen = ret;
+	libxfs_attr_sethash(&args);
+
+	error = -libxfs_attr_set(&args, XFS_ATTRUPDATE_UPSERT, false);
+	if (error)
+		fail(_("setting xattr value"), error);
+}
+
+static void
+writeattrs(
+	struct xfs_inode	*ip,
+	const char		*fname,
+	int			fd)
+{
+	char			*namebuf, *p, *end;
+	char			*valuebuf = NULL;
+	ssize_t			ret;
+
+	namebuf = malloc(XATTR_LIST_MAX);
+	if (!namebuf)
+		fail(_("error allocating xattr name buffer"), errno);
+
+	ret = flistxattr(fd, namebuf, XATTR_LIST_MAX);
+	if (ret < 0) {
+		if (errno == EOPNOTSUPP)
+			goto out_namebuf;
+		fail(_("error collecting xattr names"), errno);
+	}
+
+	p = namebuf;
+	end = namebuf + ret;
+	for (p = namebuf; p < end; p += strlen(p) + 1) {
+		if (!valuebuf) {
+			valuebuf = malloc(ATTR_MAX_VALUELEN);
+			if (!valuebuf)
+				fail(_("error allocating xattr value buffer"),
+						errno);
+		}
+
+		writeattr(ip, fname, fd, p, valuebuf, ATTR_MAX_VALUELEN);
+	}
+
+	free(valuebuf);
+out_namebuf:
+	free(namebuf);
+}
+
+static int
+newregfile(
+	char		**pp,
+	char		**fname)
+{
+	int		fd;
+	off_t		size;
+
+	*fname = getstr(pp);
+	if ((fd = open(*fname, O_RDONLY)) < 0 || (size = filesize(fd)) < 0) {
+		fprintf(stderr, _("%s: cannot open %s: %s\n"),
+			progname, *fname, strerror(errno));
+		exit(1);
+	}
+
+	return fd;
 }
 
 static void
@@ -471,6 +593,65 @@ creatproto(
 	return 0;
 }
 
+/* Create a new metadata root directory. */
+static int
+create_metadir(
+	struct xfs_mount	*mp)
+{
+	struct xfs_inode	*ip = NULL;
+	struct xfs_trans	*tp;
+	int			error;
+	struct xfs_icreate_args	args = {
+		.mode		= S_IFDIR,
+		.flags		= XFS_ICREATE_UNLINKABLE,
+	};
+	xfs_ino_t		ino;
+
+	if (!xfs_has_metadir(mp))
+		return 0;
+
+	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_create,
+			libxfs_create_space_res(mp, MAXNAMELEN), 0, 0, &tp);
+	if (error)
+		return error;
+
+	/*
+	 * Create a new inode and set the sb pointer.  The primary super is
+	 * still marked inprogress, so we do not need to log the metadirino
+	 * change ourselves.
+	 */
+	error = -libxfs_dialloc(&tp, &args, &ino);
+	if (error)
+		goto out_cancel;
+	error = -libxfs_icreate(tp, ino, &args, &ip);
+	if (error)
+		goto out_cancel;
+	mp->m_sb.sb_metadirino = ino;
+
+	/*
+	 * Initialize the root directory.  There are no ILOCKs in userspace
+	 * so we do not need to drop it here.
+	 */
+	libxfs_metafile_set_iflag(tp, ip, XFS_METAFILE_DIR);
+	error = -libxfs_dir_init(tp, ip, ip);
+	if (error)
+		goto out_cancel;
+
+	error = -libxfs_trans_commit(tp);
+	if (error)
+		goto out_rele;
+
+	mp->m_metadirip = ip;
+	return 0;
+
+out_cancel:
+	libxfs_trans_cancel(tp);
+out_rele:
+	if (ip)
+		libxfs_irele(ip);
+	return error;
+}
+
 static void
 parseproto(
 	xfs_mount_t	*mp,
@@ -493,7 +674,8 @@ parseproto(
 	int		fmt;
 	int		i;
 	xfs_inode_t	*ip;
-	int		len;
+	int		fd = -1;
+	off_t		len;
 	long long	llen;
 	int		majdev;
 	int		mindev;
@@ -504,6 +686,7 @@ parseproto(
 	int		isroot = 0;
 	struct cred	creds;
 	char		*value;
+	char		*fname = NULL;
 	struct xfs_name	xname;
 	struct xfs_parent_args *ppargs = NULL;
 
@@ -577,16 +760,13 @@ parseproto(
 	flags = XFS_ILOG_CORE;
 	switch (fmt) {
 	case IF_REGULAR:
-		buf = newregfile(pp, &len);
-		tp = getres(mp, XFS_B_TO_FSB(mp, len));
+		fd = newregfile(pp, &fname);
+		tp = getres(mp, 0);
 		ppargs = newpptr(mp);
 		error = creatproto(&tp, pip, mode | S_IFREG, 0, &creds, fsxp,
 				&ip);
 		if (error)
 			fail(_("Inode allocation failed"), error);
-		writefile(tp, ip, buf, len);
-		if (buf)
-			free(buf);
 		libxfs_trans_ijoin(tp, pip, 0);
 		xname.type = XFS_DIR3_FT_REG_FILE;
 		newdirent(mp, tp, pip, &xname, ip, ppargs);
@@ -709,8 +889,15 @@ parseproto(
 		 * RT initialization.  Do this here to ensure that
 		 * the RT inodes get placed after the root inode.
 		 */
-		if (isroot)
+		if (isroot) {
+			error = create_metadir(mp);
+			if (error)
+				fail(
+	_("Creation of the metadata directory inode failed"),
+					error);
+
 			rtinit(mp);
+		}
 		tp = NULL;
 		for (;;) {
 			name = getdirentname(pp);
@@ -734,6 +921,11 @@ parseproto(
 	}
 
 	libxfs_parent_finish(mp, ppargs);
+	if (fmt == IF_REGULAR) {
+		writefile(ip, fname, fd);
+		writeattrs(ip, fname, fd);
+		close(fd);
+	}
 	libxfs_irele(ip);
 }
 
@@ -751,9 +943,14 @@ parse_proto(
 /* Create a sb-rooted metadata file. */
 static void
 create_sb_metadata_file(
-	struct xfs_mount	*mp,
-	void			(*create)(struct xfs_inode *ip))
+	struct xfs_rtgroup	*rtg,
+	enum xfs_rtg_inodes	type,
+	int			(*create)(struct xfs_rtgroup *rtg,
+					  struct xfs_inode *ip,
+					  struct xfs_trans *tp,
+					  bool init))
 {
+	struct xfs_mount	*mp = rtg_mount(rtg);
 	struct xfs_icreate_args	args = {
 		.mode		= S_IFREG,
 		.flags		= XFS_ICREATE_UNLINKABLE,
@@ -775,14 +972,30 @@ create_sb_metadata_file(
 	if (error)
 		goto fail;
 
-	create(ip);
+	error = create(rtg, ip, tp, true);
+	if (error < 0)
+		error = -error;
+	if (error)
+		goto fail;
 
-	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	switch (type) {
+	case XFS_RTGI_BITMAP:
+		mp->m_sb.sb_rbmino = ip->i_ino;
+		break;
+	case XFS_RTGI_SUMMARY:
+		mp->m_sb.sb_rsumino = ip->i_ino;
+		break;
+	default:
+		error = EFSCORRUPTED;
+		goto fail;
+	}
 	libxfs_log_sb(tp);
 
 	error = -libxfs_trans_commit(tp);
 	if (error)
 		goto fail;
+	rtg->rtg_inodes[type] = ip;
+	return;
 
 fail:
 	if (ip)
@@ -791,83 +1004,118 @@ fail:
 		fail(_("Realtime inode allocation failed"), error);
 }
 
-static void
-rtbitmap_create(
-	struct xfs_inode	*ip)
-{
-	struct xfs_mount	*mp = ip->i_mount;
-
-	ip->i_disk_size = mp->m_sb.sb_rbmblocks * mp->m_sb.sb_blocksize;
-	ip->i_diflags |= XFS_DIFLAG_NEWRTBM;
-	inode_set_atime(VFS_I(ip), 0, 0);
-
-	mp->m_sb.sb_rbmino = ip->i_ino;
-	mp->m_rbmip = ip;
-	ihold(VFS_I(ip));
-}
-
-static void
-rtsummary_create(
-	struct xfs_inode	*ip)
-{
-	struct xfs_mount	*mp = ip->i_mount;
-
-	ip->i_disk_size = mp->m_rsumblocks * mp->m_sb.sb_blocksize;
-
-	mp->m_sb.sb_rsumino = ip->i_ino;
-	mp->m_rsumip = ip;
-	ihold(VFS_I(ip));
-}
-
 /*
- * Free the whole realtime area using transactions.
- * Do one transaction per bitmap block.
+ * Free the whole realtime area using transactions.  Each transaction may clear
+ * up to 32 rtbitmap blocks.
  */
 static void
 rtfreesp_init(
-	struct xfs_mount	*mp)
+	struct xfs_rtgroup	*rtg)
 {
+	struct xfs_mount	*mp = rtg_mount(rtg);
 	struct xfs_trans	*tp;
-	xfs_rtxnum_t		rtx;
-	xfs_rtxnum_t		ertx;
+	const xfs_rtxnum_t	max_rtx = mp->m_rtx_per_rbmblock * 32;
+	xfs_rtxnum_t		start_rtx = 0;
 	int			error;
 
 	/*
 	 * First zero the realtime bitmap and summary files.
 	 */
-	error = -libxfs_rtfile_initialize_blocks(mp->m_rbmip, 0,
+	error = -libxfs_rtfile_initialize_blocks(rtg, XFS_RTGI_BITMAP, 0,
 			mp->m_sb.sb_rbmblocks, NULL);
 	if (error)
 		fail(_("Initialization of rtbitmap inode failed"), error);
 
-	error = -libxfs_rtfile_initialize_blocks(mp->m_rsumip, 0,
+	error = -libxfs_rtfile_initialize_blocks(rtg, XFS_RTGI_SUMMARY, 0,
 			mp->m_rsumblocks, NULL);
 	if (error)
 		fail(_("Initialization of rtsummary inode failed"), error);
 
+	if (!mp->m_sb.sb_rbmblocks)
+		return;
+
 	/*
 	 * Then free the blocks into the allocator, one bitmap block at a time.
 	 */
-	for (rtx = 0; rtx < mp->m_sb.sb_rextents; rtx = ertx) {
+	while (start_rtx < rtg->rtg_extents) {
+		xfs_rtxlen_t	nr = min(rtg->rtg_extents - start_rtx, max_rtx);
+
+		/*
+		 * The rt superblock, if present, must not be marked free.
+		 * This may be the only rtx in the entire volume.
+		 */
+		if (xfs_has_rtsb(mp) && rtg_rgno(rtg) == 0 && start_rtx == 0) {
+			start_rtx++;
+			nr--;
+
+			if (start_rtx == rtg->rtg_extents)
+				break;
+		}
+
 		error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate,
 				0, 0, 0, &tp);
 		if (error)
 			res_failed(error);
 
-		libxfs_trans_ijoin(tp, mp->m_rbmip, 0);
-		ertx = min(mp->m_sb.sb_rextents,
-			   rtx + NBBY * mp->m_sb.sb_blocksize);
-
-		error = -libxfs_rtfree_extent(tp, rtx,
-				(xfs_rtxlen_t)(ertx - rtx));
+		libxfs_trans_ijoin(tp, rtg->rtg_inodes[XFS_RTGI_BITMAP], 0);
+		error = -libxfs_rtfree_extent(tp, rtg, start_rtx, nr);
 		if (error) {
-			fail(_("Error initializing the realtime space"),
-				error);
+			fprintf(stderr,
+ _("Error initializing the realtime free space near rgno %u rtx %lld-%lld (max %lld): %s\n"),
+					rtg_rgno(rtg),
+					(unsigned long long)start_rtx,
+					(unsigned long long)start_rtx + nr - 1,
+					(unsigned long long)rtg->rtg_extents,
+					strerror(error));
+			exit(1);
 		}
+
 		error = -libxfs_trans_commit(tp);
 		if (error)
 			fail(_("Initialization of the realtime space failed"),
 					error);
+
+		start_rtx += nr;
+	}
+}
+
+static void
+rtinit_nogroups(
+	struct xfs_mount	*mp)
+{
+	struct xfs_rtgroup	*rtg = NULL;
+
+	while ((rtg = xfs_rtgroup_next(mp, rtg))) {
+		create_sb_metadata_file(rtg, XFS_RTGI_BITMAP,
+				libxfs_rtbitmap_create);
+		create_sb_metadata_file(rtg, XFS_RTGI_SUMMARY,
+				libxfs_rtsummary_create);
+
+		rtfreesp_init(rtg);
+	}
+}
+
+static void
+rtinit_groups(
+	struct xfs_mount	*mp)
+{
+	struct xfs_rtgroup	*rtg = NULL;
+	unsigned int		i;
+	int			error;
+
+	error = -libxfs_rtginode_mkdir_parent(mp);
+	if (error)
+		fail(_("rtgroup directory allocation failed"), error);
+
+	while ((rtg = xfs_rtgroup_next(mp, rtg))) {
+		for (i = 0; i < XFS_RTGI_MAX; i++) {
+			error = -libxfs_rtginode_create(rtg, i, true);
+			if (error)
+				fail(_("rt group inode creation failed"),
+						error);
+		}
+
+		rtfreesp_init(rtg);
 	}
 }
 
@@ -878,13 +1126,13 @@ static void
 rtinit(
 	struct xfs_mount	*mp)
 {
-	create_sb_metadata_file(mp, rtbitmap_create);
-	create_sb_metadata_file(mp, rtsummary_create);
-
-	rtfreesp_init(mp);
+	if (xfs_has_rtgroups(mp))
+		rtinit_groups(mp);
+	else
+		rtinit_nogroups(mp);
 }
 
-static long
+static off_t
 filesize(
 	int		fd)
 {
@@ -892,5 +1140,5 @@ filesize(
 
 	if (fstat(fd, &stb) < 0)
 		return -1;
-	return (long)stb.st_size;
+	return stb.st_size;
 }

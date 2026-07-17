@@ -15,6 +15,7 @@
 #include "versions.h"
 #include "prefetch.h"
 #include "progress.h"
+#include "rt.h"
 
 /*
  * validates inode block or chunk, returns # of good inodes
@@ -132,7 +133,7 @@ verify_inode_chunk(xfs_mount_t		*mp,
 		if (check_aginode_block(mp, agno, agino) == 0)
 			return 0;
 
-		pthread_mutex_lock(&ag_locks[agno].lock);
+		lock_ag(agno);
 
 		state = get_bmap(agno, agbno);
 		switch (state) {
@@ -141,6 +142,16 @@ verify_inode_chunk(xfs_mount_t		*mp,
 		_("uncertain inode block %d/%d already known\n"),
 				agno, agbno);
 			break;
+		case XR_E_METADATA:
+			/*
+			 * Files in the metadata directory tree are always
+			 * reconstructed, so it's ok to let go if this block
+			 * is also a valid inode cluster.
+			 */
+			do_warn(
+		_("inode block %d/%d claimed by metadata file\n"),
+				agno, agbno);
+			fallthrough;
 		case XR_E_UNKNOWN:
 		case XR_E_FREE1:
 		case XR_E_FREE:
@@ -157,8 +168,8 @@ verify_inode_chunk(xfs_mount_t		*mp,
 		_("inode block %d/%d multiply claimed, (state %d)\n"),
 				agno, agbno, state);
 			set_bmap(agno, agbno, XR_E_MULT);
-			pthread_mutex_unlock(&ag_locks[agno].lock);
-			return(0);
+			unlock_ag(agno);
+			return 0;
 		default:
 			do_warn(
 		_("inode block %d/%d bad state, (state %d)\n"),
@@ -167,7 +178,7 @@ verify_inode_chunk(xfs_mount_t		*mp,
 			break;
 		}
 
-		pthread_mutex_unlock(&ag_locks[agno].lock);
+		unlock_ag(agno);
 
 		start_agino = XFS_AGB_TO_AGINO(mp, agbno);
 		*start_ino = XFS_AGINO_TO_INO(mp, agno, start_agino);
@@ -414,11 +425,12 @@ verify_inode_chunk(xfs_mount_t		*mp,
 	 * user data -- we're probably here as a result of a directory
 	 * entry or an iunlinked pointer
 	 */
-	pthread_mutex_lock(&ag_locks[agno].lock);
+	lock_ag(agno);
 	for (cur_agbno = chunk_start_agbno;
 	     cur_agbno < chunk_stop_agbno;
 	     cur_agbno += blen)  {
-		state = get_bmap_ext(agno, cur_agbno, chunk_stop_agbno, &blen);
+		state = get_bmap_ext(agno, cur_agbno, chunk_stop_agbno, &blen,
+				false);
 		switch (state) {
 		case XR_E_MULT:
 		case XR_E_INUSE:
@@ -427,9 +439,10 @@ verify_inode_chunk(xfs_mount_t		*mp,
 			do_warn(
 	_("inode block %d/%d multiply claimed, (state %d)\n"),
 				agno, cur_agbno, state);
-			set_bmap_ext(agno, cur_agbno, blen, XR_E_MULT);
-			pthread_mutex_unlock(&ag_locks[agno].lock);
+			set_bmap_ext(agno, cur_agbno, blen, XR_E_MULT, false);
+			unlock_ag(agno);
 			return 0;
+		case XR_E_METADATA:
 		case XR_E_INO:
 			do_error(
 	_("uncertain inode block overlap, agbno = %d, ino = %" PRIu64 "\n"),
@@ -439,7 +452,7 @@ verify_inode_chunk(xfs_mount_t		*mp,
 			break;
 		}
 	}
-	pthread_mutex_unlock(&ag_locks[agno].lock);
+	unlock_ag(agno);
 
 	/*
 	 * ok, chunk is good.  put the record into the tree if required,
@@ -462,22 +475,32 @@ verify_inode_chunk(xfs_mount_t		*mp,
 
 	set_inode_used(irec_p, agino - start_agino);
 
-	pthread_mutex_lock(&ag_locks[agno].lock);
-
+	lock_ag(agno);
 	for (cur_agbno = chunk_start_agbno;
 	     cur_agbno < chunk_stop_agbno;
 	     cur_agbno += blen)  {
-		state = get_bmap_ext(agno, cur_agbno, chunk_stop_agbno, &blen);
+		state = get_bmap_ext(agno, cur_agbno, chunk_stop_agbno, &blen,
+				false);
 		switch (state) {
 		case XR_E_INO:
 			do_error(
 		_("uncertain inode block %" PRIu64 " already known\n"),
 				XFS_AGB_TO_FSB(mp, agno, cur_agbno));
 			break;
+		case XR_E_METADATA:
+			/*
+			 * Files in the metadata directory tree are always
+			 * reconstructed, so it's ok to let go if this block
+			 * is also a valid inode cluster.
+			 */
+			do_warn(
+		_("inode block %d/%d claimed by metadata file\n"),
+				agno, agbno);
+			fallthrough;
 		case XR_E_UNKNOWN:
 		case XR_E_FREE1:
 		case XR_E_FREE:
-			set_bmap_ext(agno, cur_agbno, blen, XR_E_INO);
+			set_bmap_ext(agno, cur_agbno, blen, XR_E_INO, false);
 			break;
 		case XR_E_MULT:
 		case XR_E_INUSE:
@@ -491,11 +514,11 @@ verify_inode_chunk(xfs_mount_t		*mp,
 			do_warn(
 		_("inode block %d/%d bad state, (state %d)\n"),
 				agno, cur_agbno, state);
-			set_bmap_ext(agno, cur_agbno, blen, XR_E_INO);
+			set_bmap_ext(agno, cur_agbno, blen, XR_E_INO, false);
 			break;
 		}
 	}
-	pthread_mutex_unlock(&ag_locks[agno].lock);
+	unlock_ag(agno);
 
 	return(ino_cnt);
 }
@@ -554,11 +577,21 @@ process_inode_agbno_state(
 {
 	int state;
 
-	pthread_mutex_lock(&ag_locks[agno].lock);
+	lock_ag(agno);
 	state = get_bmap(agno, agbno);
 	switch (state) {
 	case XR_E_INO:	/* already marked */
 		break;
+	case XR_E_METADATA:
+		/*
+		 * Files in the metadata directory tree are always
+		 * reconstructed, so it's ok to let go if this block is also a
+		 * valid inode cluster.
+		 */
+		do_warn(
+	_("inode block %d/%d claimed by metadata file\n"),
+			agno, agbno);
+		fallthrough;
 	case XR_E_UNKNOWN:
 	case XR_E_FREE:
 	case XR_E_FREE1:
@@ -574,7 +607,7 @@ process_inode_agbno_state(
 			XFS_AGB_TO_FSB(mp, agno, agbno), state);
 		break;
 	}
-	pthread_mutex_unlock(&ag_locks[agno].lock);
+	unlock_ag(agno);
 }
 
 /*
@@ -896,7 +929,7 @@ next_readbuf:
 			set_inode_disk_nlinks(ino_rec, irec_offset,
 				dino->di_version > 1
 					? be32_to_cpu(dino->di_nlink)
-					: be16_to_cpu(dino->di_onlink));
+					: be16_to_cpu(dino->di_metatype));
 
 		} else  {
 			set_inode_free(ino_rec, irec_offset);
@@ -932,6 +965,18 @@ next_readbuf:
 	_("would clear root inode %" PRIu64 "\n"),
 						ino);
 				}
+			} else if (mp->m_sb.sb_metadirino == ino) {
+				need_metadir_inode = true;
+
+				if (!no_modify)  {
+					do_warn(
+	_("cleared metadata directory %" PRIu64 "\n"),
+						ino);
+				} else  {
+					do_warn(
+	_("would clear metadata directory %" PRIu64 "\n"),
+						ino);
+				}
 			} else if (mp->m_sb.sb_rbmino == ino) {
 				need_rbmino = 1;
 
@@ -954,6 +999,28 @@ next_readbuf:
 				} else  {
 					do_warn(
 	_("would clear realtime summary inode %" PRIu64 "\n"),
+						ino);
+				}
+			} else if (is_rtbitmap_inode(ino)) {
+				mark_rtgroup_inodes_bad(mp, XFS_RTGI_BITMAP);
+				if (!no_modify)  {
+					do_warn(
+	_("cleared rtgroup bitmap inode %" PRIu64 "\n"),
+						ino);
+				} else  {
+					do_warn(
+	_("would clear rtgroup bitmap inode %" PRIu64 "\n"),
+						ino);
+				}
+			} else if (is_rtsummary_inode(ino)) {
+				mark_rtgroup_inodes_bad(mp, XFS_RTGI_SUMMARY);
+				if (!no_modify)  {
+					do_warn(
+	_("cleared rtgroup summary inode %" PRIu64 "\n"),
+						ino);
+				} else  {
+					do_warn(
+	_("would clear rtgroup summary inode %" PRIu64 "\n"),
 						ino);
 				}
 			} else if (!no_modify)  {

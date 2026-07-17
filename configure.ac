@@ -1,4 +1,4 @@
-AC_INIT([xfsprogs],[6.12.0],[linux-xfs@vger.kernel.org])
+AC_INIT([xfsprogs],[6.13.0],[linux-xfs@vger.kernel.org])
 AC_PREREQ([2.69])
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
@@ -177,6 +177,7 @@ AC_CONFIG_SYSTEMD_SYSTEM_UNIT_DIR
 AC_CONFIG_CROND_DIR
 AC_CONFIG_UDEV_RULE_DIR
 AC_HAVE_BLKID_TOPO
+AC_HAVE_TRIVIAL_AUTO_VAR_INIT
 
 if test "$enable_ubsan" = "yes" || test "$enable_ubsan" = "probe"; then
         AC_PACKAGE_CHECK_UBSAN

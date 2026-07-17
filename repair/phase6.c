@@ -19,6 +19,8 @@
 #include "progress.h"
 #include "versions.h"
 #include "repair/pptr.h"
+#include "repair/rt.h"
+#include "repair/quotacheck.h"
 
 static xfs_ino_t		orphanage_ino;
 
@@ -474,140 +476,236 @@ reset_sbroot_ino(
 	libxfs_inode_init(tp, &args, ip);
 }
 
+/*
+ * Mark a newly allocated inode as metadata in the incore bitmap.  Callers
+ * must have already called mark_ino_inuse to ensure there is an incore record.
+ */
 static void
-mk_rbmino(
-	struct xfs_mount	*mp)
+mark_ino_metadata(
+	struct xfs_mount	*mp,
+	xfs_ino_t		ino)
 {
+	struct ino_tree_node	*irec =
+		find_inode_rec(mp, XFS_INO_TO_AGNO(mp, ino),
+				   XFS_INO_TO_AGINO(mp, ino));
+
+	set_inode_is_meta(irec, get_inode_offset(mp, ino, irec));
+}
+
+/* (Re)create a missing sb-rooted rt freespace inode. */
+static void
+mk_rtino(
+	struct xfs_rtgroup	*rtg,
+	enum xfs_rtg_inodes	type)
+{
+	struct xfs_mount	*mp = rtg_mount(rtg);
+	struct xfs_inode	*ip = rtg->rtg_inodes[type];
 	struct xfs_trans	*tp;
-	struct xfs_inode	*ip;
+	enum xfs_metafile_type	metafile_type =
+		libxfs_rtginode_metafile_type(type);
 	int			error;
 
 	error = -libxfs_trans_alloc_rollable(mp, 10, &tp);
 	if (error)
 		res_failed(error);
 
-	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rbmino, 0, &ip);
-	if (error) {
-		do_error(
-		_("couldn't iget realtime bitmap inode -- error - %d\n"),
-			error);
+	if (!ip) {
+		xfs_ino_t	rootino = mp->m_sb.sb_rootino;
+		xfs_ino_t	ino = NULLFSINO;
+
+		if (xfs_has_metadir(mp))
+			rootino++;
+
+		switch (type) {
+		case XFS_RTGI_BITMAP:
+			mp->m_sb.sb_rbmino = rootino + 1;
+			ino = mp->m_sb.sb_rbmino;
+			break;
+		case XFS_RTGI_SUMMARY:
+			mp->m_sb.sb_rsumino = rootino + 2;
+			ino = mp->m_sb.sb_rsumino;
+			break;
+		default:
+			break;
+		}
+
+		/*
+		 * Don't use metafile iget here because we're resetting
+		 * sb-rooted inodes that live at fixed inumbers, but these
+		 * inodes could be in an arbitrary state.
+		 */
+		error = -libxfs_iget(mp, tp, ino, 0, &ip);
+		if (error) {
+			do_error(
+_("couldn't iget realtime %s inode -- error - %d\n"),
+					libxfs_rtginode_name(type),
+					error);
+		}
+
+		rtg->rtg_inodes[type] = ip;
 	}
 
-	/* Reset the realtime bitmap inode. */
 	reset_sbroot_ino(tp, S_IFREG, ip);
-	ip->i_disk_size = mp->m_sb.sb_rbmblocks * mp->m_sb.sb_blocksize;
-	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	if (xfs_has_metadir(mp))
+		libxfs_metafile_set_iflag(tp, ip, metafile_type);
+
+	switch (type) {
+	case XFS_RTGI_BITMAP:
+		error = -libxfs_rtbitmap_create(rtg, ip, tp, false);
+		break;
+	case XFS_RTGI_SUMMARY:
+		error = -libxfs_rtsummary_create(rtg, ip, tp, false);
+		break;
+	default:
+		error = EINVAL;
+	}
+
+	if (error)
+		do_error(_("%s inode re-initialization failed for rtgroup %u\n"),
+			libxfs_rtginode_name(type), rtg_rgno(rtg));
+
 	error = -libxfs_trans_commit(tp);
 	if (error)
 		do_error(_("%s: commit failed, error %d\n"), __func__, error);
-	libxfs_irele(ip);
 }
 
+/* Mark a newly allocated inode in use in the incore bitmap. */
 static void
-fill_rbmino(
-	struct xfs_mount	*mp)
+mark_ino_inuse(
+	struct xfs_mount	*mp,
+	xfs_ino_t		ino,
+	int			mode,
+	xfs_ino_t		parent)
 {
-	struct xfs_trans	*tp;
-	struct xfs_inode	*ip;
+	struct ino_tree_node	*irec;
+	int			ino_offset;
+	int			i;
+
+	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, ino),
+			XFS_INO_TO_AGINO(mp, ino));
+
+	if (irec == NULL) {
+		/*
+		 * This inode is allocated from a newly created inode
+		 * chunk and therefore did not exist when inode chunks
+		 * were processed in phase3. Add this group of inodes to
+		 * the entry avl tree as if they were discovered in phase3.
+		 */
+		irec = set_inode_free_alloc(mp,
+				XFS_INO_TO_AGNO(mp, ino),
+				XFS_INO_TO_AGINO(mp, ino));
+		alloc_ex_data(irec);
+
+		for (i = 0; i < XFS_INODES_PER_CHUNK; i++)
+			set_inode_free(irec, i);
+	}
+
+	ino_offset = get_inode_offset(mp, ino, irec);
+
+	/*
+	 * Mark the inode allocated so it is not skipped in phase 7.  We'll
+	 * find it with the directory traverser soon, so we don't need to
+	 * mark it reached.
+	 */
+	set_inode_used(irec, ino_offset);
+	set_inode_ftype(irec, ino_offset, libxfs_mode_to_ftype(mode));
+	set_inode_parent(irec, ino_offset, parent);
+	if (S_ISDIR(mode))
+		set_inode_isadir(irec, ino_offset);
+}
+
+static bool
+ensure_rtgroup_file(
+	struct xfs_rtgroup	*rtg,
+	enum xfs_rtg_inodes	type)
+{
+	struct xfs_mount	*mp = rtg_mount(rtg);
+	struct xfs_inode	*ip = rtg->rtg_inodes[type];
+	const char		*name = libxfs_rtginode_name(type);
 	int			error;
 
-	error = -libxfs_trans_alloc_rollable(mp, 10, &tp);
-	if (error)
-		res_failed(error);
+	if (!xfs_rtginode_enabled(rtg, type))
+		return false;
 
-	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rbmino, 0, &ip);
-	libxfs_trans_cancel(tp);
+	if (no_modify) {
+		if (rtgroup_inodes_were_bad(type))
+			do_warn(_("would reset rtgroup %u %s inode\n"),
+				rtg_rgno(rtg), name);
+		return false;
+	}
+
+	if (rtgroup_inodes_were_bad(type)) {
+		/*
+		 * The inode was bad or missing, state that we'll make a new
+		 * one even though we always create a new one.
+		 */
+		do_warn(_("resetting rtgroup %u %s inode\n"),
+			rtg_rgno(rtg), name);
+	}
+
+	error = -libxfs_rtginode_create(rtg, type, false);
 	if (error)
 		do_error(
-_("couldn't iget realtime bitmap inode, error %d\n"), error);
+_("Couldn't create rtgroup %u %s inode, error %d\n"),
+			rtg_rgno(rtg), name, error);
 
-	error = -libxfs_rtfile_initialize_blocks(ip, 0, mp->m_sb.sb_rbmblocks,
-			btmcompute);
-	if (error)
-		do_error(
-_("couldn't re-initialize realtime bitmap inode, error %d\n"), error);
+	ip = rtg->rtg_inodes[type];
 
-	libxfs_irele(ip);
+	/* Mark the inode in use. */
+	mark_ino_inuse(mp, ip->i_ino, S_IFREG, mp->m_rtdirip->i_ino);
+	mark_ino_metadata(mp, ip->i_ino);
+	return true;
 }
 
 static void
-fill_rsumino(
-	struct xfs_mount	*mp)
+ensure_rtgroup_bitmap(
+	struct xfs_rtgroup	*rtg)
 {
-	struct xfs_trans	*tp;
-	struct xfs_inode	*ip;
-	int			error;
+	struct xfs_mount	*mp = rtg_mount(rtg);
 
-	error = -libxfs_trans_alloc_rollable(mp, 10, &tp);
-	if (error)
-		res_failed(error);
+	if (!xfs_has_rtgroups(mp))
+		return;
+	if (!ensure_rtgroup_file(rtg, XFS_RTGI_BITMAP))
+		return;
 
-	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rsumino, 0, &ip);
-	libxfs_trans_cancel(tp);
-	if (error)
-		do_error(
-_("couldn't iget realtime summary inode, error %d\n"), error);
-
-	mp->m_rsumip = ip;
-	error = -libxfs_rtfile_initialize_blocks(ip, 0, mp->m_rsumblocks,
-			sumcompute);
-	mp->m_rsumip = NULL;
-	if (error)
-		do_error(
-_("couldn't re-initialize realtime summary inode, error %d\n"), error);
-
-	libxfs_irele(ip);
+	fill_rtbitmap(rtg);
 }
 
 static void
-mk_rsumino(xfs_mount_t *mp)
+ensure_rtgroup_summary(
+	struct xfs_rtgroup	*rtg)
+{
+	struct xfs_mount	*mp = rtg_mount(rtg);
+
+	if (!xfs_has_rtgroups(mp))
+		return;
+	if (!ensure_rtgroup_file(rtg, XFS_RTGI_SUMMARY))
+		return;
+
+	fill_rtsummary(rtg);
+}
+
+/* Initialize a root directory. */
+static int
+init_fs_root_dir(
+	struct xfs_mount	*mp,
+	xfs_ino_t		ino,
+	mode_t			mode,
+	struct xfs_inode	**ipp)
 {
 	struct xfs_trans	*tp;
-	struct xfs_inode	*ip;
+	struct xfs_inode	*ip = NULL;
+	struct ino_tree_node	*irec;
 	int			error;
 
 	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 10, 0, 0, &tp);
 	if (error)
-		res_failed(error);
+		return error;
 
-	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rsumino, 0, &ip);
+	error = -libxfs_iget(mp, tp, ino, 0, &ip);
 	if (error) {
-		do_error(
-		_("couldn't iget realtime summary inode -- error - %d\n"),
-			error);
-	}
-
-	/* Reset the rt summary inode. */
-	reset_sbroot_ino(tp, S_IFREG, ip);
-	ip->i_disk_size = mp->m_rsumblocks * mp->m_sb.sb_blocksize;
-	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-	error = -libxfs_trans_commit(tp);
-	if (error)
-		do_error(_("%s: commit failed, error %d\n"), __func__, error);
-	libxfs_irele(ip);
-}
-
-/*
- * makes a new root directory.
- */
-static void
-mk_root_dir(xfs_mount_t *mp)
-{
-	xfs_trans_t	*tp;
-	xfs_inode_t	*ip;
-	int		i;
-	int		error;
-	const mode_t	mode = 0755;
-	ino_tree_node_t	*irec;
-
-	ip = NULL;
-	i = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 10, 0, 0, &tp);
-	if (i)
-		res_failed(i);
-
-	error = -libxfs_iget(mp, tp, mp->m_sb.sb_rootino, 0, &ip);
-	if (error) {
-		do_error(_("could not iget root inode -- error - %d\n"), error);
+		libxfs_trans_cancel(tp);
+		return error;
 	}
 
 	/* Reset the root directory. */
@@ -616,14 +714,64 @@ mk_root_dir(xfs_mount_t *mp)
 
 	error = -libxfs_trans_commit(tp);
 	if (error)
-		do_error(_("%s: commit failed, error %d\n"), __func__, error);
+		return error;
+
+	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, ino),
+				XFS_INO_TO_AGINO(mp, ino));
+	set_inode_isadir(irec, XFS_INO_TO_AGINO(mp, ino) - irec->ino_startnum);
+	*ipp = ip;
+	return 0;
+}
+
+/*
+ * makes a new root directory.
+ */
+static void
+mk_root_dir(xfs_mount_t *mp)
+{
+	struct xfs_inode	*ip = NULL;
+	int			error;
+
+	error = init_fs_root_dir(mp, mp->m_sb.sb_rootino, 0755, &ip);
+	if (error)
+		do_error(
+	_("Could not reinitialize root directory inode, error %d\n"),
+			error);
 
 	libxfs_irele(ip);
+}
 
-	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, mp->m_sb.sb_rootino),
-				XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rootino));
-	set_inode_isadir(irec, XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rootino) -
-				irec->ino_startnum);
+/* Create a new metadata directory root. */
+static void
+mk_metadir(
+	struct xfs_mount	*mp)
+{
+	struct xfs_trans	*tp;
+	int			error;
+
+	libxfs_rtginode_irele(&mp->m_rtdirip);
+
+	error = init_fs_root_dir(mp, mp->m_sb.sb_metadirino, 0,
+			&mp->m_metadirip);
+	if (error)
+		do_error(
+	_("Initialization of the metadata root directory failed, error %d\n"),
+			error);
+
+	/* Mark the new metadata root dir as metadata. */
+	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
+	if (error)
+		do_error(
+	_("Marking metadata root directory failed"));
+
+	libxfs_trans_ijoin(tp, mp->m_metadirip, 0);
+	libxfs_metafile_set_iflag(tp, mp->m_metadirip, XFS_METAFILE_DIR);
+	mark_ino_metadata(mp, mp->m_metadirip->i_ino);
+
+	error = -libxfs_trans_commit(tp);
+	if (error)
+		do_error(
+	_("Marking metadata root directory failed, error %d\n"), error);
 }
 
 /*
@@ -762,6 +910,53 @@ out_pip:
 	return(ino);
 }
 
+/* Don't let metadata inode contents leak to lost+found. */
+static void
+trunc_metadata_inode(
+	struct xfs_inode	*ip)
+{
+	struct xfs_trans	*tp;
+	struct xfs_mount	*mp = ip->i_mount;
+	int			err;
+
+	err = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
+	if (err)
+		do_error(
+	_("space reservation failed (%d), filesystem may be out of space\n"),
+					err);
+
+	libxfs_trans_ijoin(tp, ip, 0);
+	ip->i_diflags2 &= ~XFS_DIFLAG2_METADATA;
+
+	switch (VFS_I(ip)->i_mode & S_IFMT) {
+	case S_IFIFO:
+	case S_IFCHR:
+	case S_IFBLK:
+	case S_IFSOCK:
+		ip->i_df.if_format = XFS_DINODE_FMT_DEV;
+		break;
+	case S_IFREG:
+		switch (ip->i_df.if_format) {
+		case XFS_DINODE_FMT_EXTENTS:
+		case XFS_DINODE_FMT_BTREE:
+			break;
+		default:
+			ip->i_df.if_format = XFS_DINODE_FMT_EXTENTS;
+			ip->i_df.if_nextents = 0;
+			break;
+		}
+		break;
+	}
+
+	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+
+	err = -libxfs_trans_commit(tp);
+	if (err)
+		do_error(
+	_("truncation of metadata inode 0x%llx failed, err=%d\n"),
+				(unsigned long long)ip->i_ino, err);
+}
+
 /*
  * Add a parent pointer back to the orphanage for any file we're moving into
  * the orphanage, being careful not to trip over any existing parent pointer.
@@ -851,6 +1046,9 @@ mv_orphanage(
 	err = -libxfs_iget(mp, NULL, ino, 0, &ino_p);
 	if (err)
 		do_error(_("%d - couldn't iget disconnected inode\n"), err);
+
+	if (xfs_is_metadir_inode(ino_p))
+		trunc_metadata_inode(ino_p);
 
 	xname.type = libxfs_mode_to_ftype(VFS_I(ino_p)->i_mode);
 
@@ -1139,6 +1337,8 @@ longform_dir2_rebuild(
 
 	if (ino == mp->m_sb.sb_rootino)
 		need_root_dotdot = 0;
+	else if (ino == mp->m_sb.sb_metadirino)
+		need_metadir_dotdot = 0;
 
 	/* go through the hash list and re-add the inodes */
 
@@ -1527,6 +1727,38 @@ longform_dir2_entry_check_data(
 			nbad++;
 			if (entry_junked(
 	_("entry \"%s\" in directory inode %" PRIu64 " points to free inode %" PRIu64 ", "),
+					fname, ip->i_ino, inum, NULLFSINO)) {
+				dep->name[0] = '/';
+				libxfs_dir2_data_log_entry(&da, bp, dep);
+			}
+			continue;
+		}
+
+		/*
+		 * Regular directories cannot point to metadata files.  If
+		 * we find such a thing, blow out the entry.
+		 */
+		if (!xfs_is_metadir_inode(ip) &&
+		    inode_is_meta(irec, ino_offset)) {
+			nbad++;
+			if (entry_junked(
+	_("entry \"%s\" in regular dir %" PRIu64" points to a metadata inode %" PRIu64 ", "),
+					fname, ip->i_ino, inum, NULLFSINO)) {
+				dep->name[0] = '/';
+				libxfs_dir2_data_log_entry(&da, bp, dep);
+			}
+			continue;
+		}
+
+		/*
+		 * Metadata directories cannot point to regular files.  If
+		 * we find such a thing, blow out the entry.
+		 */
+		if (xfs_is_metadir_inode(ip) &&
+		    !inode_is_meta(irec, ino_offset)) {
+			nbad++;
+			if (entry_junked(
+	_("entry \"%s\" in metadata dir %" PRIu64" points to a regular inode %" PRIu64 ", "),
 					fname, ip->i_ino, inum, NULLFSINO)) {
 				dep->name[0] = '/';
 				libxfs_dir2_data_log_entry(&da, bp, dep);
@@ -2445,6 +2677,37 @@ shortform_dir2_entry_check(
 						ino_dirty);
 			continue;
 		}
+
+		/*
+		 * Regular directories cannot point to metadata files.  If
+		 * we find such a thing, blow out the entry.
+		 */
+		if (!xfs_is_metadir_inode(ip) &&
+		    inode_is_meta(irec, ino_offset)) {
+			do_warn(
+	_("entry \"%s\" in regular dir %" PRIu64" points to a metadata inode %" PRIu64 ", "),
+					fname, ip->i_ino, lino);
+			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
+						&max_size, &i, &bytes_deleted,
+						ino_dirty);
+			continue;
+		}
+
+		/*
+		 * Metadata directories cannot point to regular files.  If
+		 * we find such a thing, blow out the entry.
+		 */
+		if (xfs_is_metadir_inode(ip) &&
+		    !inode_is_meta(irec, ino_offset)) {
+			do_warn(
+	_("entry \"%s\" in metadata dir %" PRIu64" points to a regular inode %" PRIu64 ", "),
+					fname, ip->i_ino, lino);
+			next_sfep = shortform_dir2_junk(mp, sfp, sfep, lino,
+						&max_size, &i, &bytes_deleted,
+						ino_dirty);
+			continue;
+		}
+
 		/*
 		 * check if this inode is lost+found dir in the root
 		 */
@@ -2650,6 +2913,62 @@ dir_hash_add_parent_ptrs(
 }
 
 /*
+ * If we have to create a .. for /, do it now *before* we delete the bogus
+ * entries, otherwise the directory could transform into a shortform dir which
+ * would probably cause the simulation to choke.  Even if the illegal entries
+ * get shifted around, it's ok because the entries are structurally intact and
+ * in in hash-value order so the simulation won't get confused if it has to
+ * move them around.
+ */
+static void
+fix_dotdot(
+	struct xfs_mount	*mp,
+	xfs_ino_t		ino,
+	struct xfs_inode	*ip,
+	xfs_ino_t		rootino,
+	const char		*tag,
+	int			*need_dotdot)
+{
+	struct xfs_trans	*tp;
+	int			nres;
+	int			error;
+
+	if (ino != rootino || !*need_dotdot)
+		return;
+
+	if (no_modify) {
+		do_warn(_("would recreate %s directory .. entry\n"), tag);
+		return;
+	}
+
+	ASSERT(ip->i_df.if_format != XFS_DINODE_FMT_LOCAL);
+
+	do_warn(_("recreating %s directory .. entry\n"), tag);
+
+	nres = libxfs_mkdir_space_res(mp, 2);
+	error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_mkdir, nres, 0, 0, &tp);
+	if (error)
+		res_failed(error);
+
+	libxfs_trans_ijoin(tp, ip, 0);
+
+	error = -libxfs_dir_createname(tp, ip, &xfs_name_dotdot, ip->i_ino,
+			nres);
+	if (error)
+		do_error(
+_("can't make \"..\" entry in %s inode %" PRIu64 ", createname error %d\n"),
+			tag ,ino, error);
+
+	libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	error = -libxfs_trans_commit(tp);
+	if (error)
+		do_error(
+_("%s inode \"..\" entry recreation failed (%d)\n"), tag, error);
+
+	*need_dotdot = 0;
+}
+
+/*
  * processes all reachable inodes in directories
  */
 static void
@@ -2704,7 +3023,7 @@ process_dir_inode(
 
 	need_dot = dirty = num_illegal = 0;
 
-	if (mp->m_sb.sb_rootino == ino)  {
+	if (mp->m_sb.sb_rootino == ino || mp->m_sb.sb_metadirino == ino) {
 		/*
 		 * mark root inode reached and bump up
 		 * link count for root inode to account
@@ -2778,45 +3097,10 @@ _("error %d fixing shortform directory %llu\n"),
 	dir_hash_add_parent_ptrs(ip, hashtab);
 	dir_hash_done(hashtab);
 
-	/*
-	 * if we have to create a .. for /, do it now *before*
-	 * we delete the bogus entries, otherwise the directory
-	 * could transform into a shortform dir which would
-	 * probably cause the simulation to choke.  Even
-	 * if the illegal entries get shifted around, it's ok
-	 * because the entries are structurally intact and in
-	 * in hash-value order so the simulation won't get confused
-	 * if it has to move them around.
-	 */
-	if (!no_modify && need_root_dotdot && ino == mp->m_sb.sb_rootino)  {
-		ASSERT(ip->i_df.if_format != XFS_DINODE_FMT_LOCAL);
-
-		do_warn(_("recreating root directory .. entry\n"));
-
-		nres = libxfs_mkdir_space_res(mp, 2);
-		error = -libxfs_trans_alloc(mp, &M_RES(mp)->tr_mkdir,
-					    nres, 0, 0, &tp);
-		if (error)
-			res_failed(error);
-
-		libxfs_trans_ijoin(tp, ip, 0);
-
-		error = -libxfs_dir_createname(tp, ip, &xfs_name_dotdot,
-					ip->i_ino, nres);
-		if (error)
-			do_error(
-	_("can't make \"..\" entry in root inode %" PRIu64 ", createname error %d\n"), ino, error);
-
-		libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-		error = -libxfs_trans_commit(tp);
-		if (error)
-			do_error(
-	_("root inode \"..\" entry recreation failed (%d)\n"), error);
-
-		need_root_dotdot = 0;
-	} else if (need_root_dotdot && ino == mp->m_sb.sb_rootino)  {
-		do_warn(_("would recreate root directory .. entry\n"));
-	}
+	fix_dotdot(mp, ino, ip, mp->m_sb.sb_rootino, "root", &need_root_dotdot);
+	if (xfs_has_metadir(mp))
+		fix_dotdot(mp, ino, ip, mp->m_sb.sb_metadirino, "metadata",
+				&need_metadir_dotdot);
 
 	/*
 	 * if we need to create the '.' entry, do so only if
@@ -2873,6 +3157,18 @@ _("error %d fixing shortform directory %llu\n"),
 	libxfs_irele(ip);
 }
 
+static void
+mark_inode(
+	struct xfs_mount	*mp,
+	xfs_ino_t		ino)
+{
+	struct ino_tree_node	*irec =
+		find_inode_rec(mp, XFS_INO_TO_AGNO(mp, ino),
+				   XFS_INO_TO_AGINO(mp, ino));
+
+	add_inode_reached(irec, XFS_INO_TO_AGINO(mp, ino) - irec->ino_startnum);
+}
+
 /*
  * mark realtime bitmap and summary inodes as reached.
  * quota inode will be marked here as well
@@ -2880,54 +3176,20 @@ _("error %d fixing shortform directory %llu\n"),
 static void
 mark_standalone_inodes(xfs_mount_t *mp)
 {
-	ino_tree_node_t		*irec;
-	int			offset;
-
-	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, mp->m_sb.sb_rbmino),
-			XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rbmino));
-
-	offset = XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rbmino) -
-			irec->ino_startnum;
-
-	add_inode_reached(irec, offset);
-
-	irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp, mp->m_sb.sb_rsumino),
-			XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rsumino));
-
-	offset = XFS_INO_TO_AGINO(mp, mp->m_sb.sb_rsumino) -
-			irec->ino_startnum;
-
-	add_inode_reached(irec, offset);
-
-	if (fs_quotas)  {
-		if (mp->m_sb.sb_uquotino
-				&& mp->m_sb.sb_uquotino != NULLFSINO)  {
-			irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp,
-						mp->m_sb.sb_uquotino),
-				XFS_INO_TO_AGINO(mp, mp->m_sb.sb_uquotino));
-			offset = XFS_INO_TO_AGINO(mp, mp->m_sb.sb_uquotino)
-					- irec->ino_startnum;
-			add_inode_reached(irec, offset);
-		}
-		if (mp->m_sb.sb_gquotino
-				&& mp->m_sb.sb_gquotino != NULLFSINO)  {
-			irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp,
-						mp->m_sb.sb_gquotino),
-				XFS_INO_TO_AGINO(mp, mp->m_sb.sb_gquotino));
-			offset = XFS_INO_TO_AGINO(mp, mp->m_sb.sb_gquotino)
-					- irec->ino_startnum;
-			add_inode_reached(irec, offset);
-		}
-		if (mp->m_sb.sb_pquotino
-				&& mp->m_sb.sb_pquotino != NULLFSINO)  {
-			irec = find_inode_rec(mp, XFS_INO_TO_AGNO(mp,
-						mp->m_sb.sb_pquotino),
-				XFS_INO_TO_AGINO(mp, mp->m_sb.sb_pquotino));
-			offset = XFS_INO_TO_AGINO(mp, mp->m_sb.sb_pquotino)
-					- irec->ino_startnum;
-			add_inode_reached(irec, offset);
-		}
+	if (!xfs_has_rtgroups(mp)) {
+		mark_inode(mp, mp->m_sb.sb_rbmino);
+		mark_inode(mp, mp->m_sb.sb_rsumino);
 	}
+
+	if (!fs_quotas || xfs_has_metadir(mp))
+		return;
+
+	if (has_quota_inode(XFS_DQTYPE_USER))
+		mark_inode(mp, get_quota_inode(XFS_DQTYPE_USER));
+	if (has_quota_inode(XFS_DQTYPE_GROUP))
+		mark_inode(mp, get_quota_inode(XFS_DQTYPE_GROUP));
+	if (has_quota_inode(XFS_DQTYPE_PROJ))
+		mark_inode(mp, get_quota_inode(XFS_DQTYPE_PROJ));
 }
 
 static void
@@ -3061,6 +3323,196 @@ traverse_ags(
 	do_inode_prefetch(mp, ag_stride, traverse_function, false, true);
 }
 
+static void
+reset_rt_sb_inodes(
+	struct xfs_mount	*mp)
+{
+	struct xfs_rtgroup	*rtg;
+
+	if (no_modify) {
+		if (need_rbmino)
+			do_warn(_("would reinitialize realtime bitmap inode\n"));
+		if (need_rsumino)
+			do_warn(_("would reinitialize realtime summary inode\n"));
+		return;
+	}
+
+	rtg = libxfs_rtgroup_grab(mp, 0);
+
+	if (need_rbmino)  {
+		do_warn(_("reinitializing realtime bitmap inode\n"));
+		mk_rtino(rtg, XFS_RTGI_BITMAP);
+		need_rbmino = 0;
+	}
+
+	if (need_rsumino)  {
+		do_warn(_("reinitializing realtime summary inode\n"));
+		mk_rtino(rtg, XFS_RTGI_SUMMARY);
+		need_rsumino = 0;
+	}
+
+	do_log(
+_("        - resetting contents of realtime bitmap and summary inodes\n"));
+
+	fill_rtbitmap(rtg);
+	fill_rtsummary(rtg);
+
+	libxfs_rtgroup_rele(rtg);
+}
+
+static void
+reset_rt_metadir_inodes(
+	struct xfs_mount	*mp)
+{
+	struct xfs_rtgroup	*rtg = NULL;
+	int			error;
+
+	/*
+	 * Release the rtgroup inodes so that we can rebuild everything from
+	 * observations.
+	 */
+	if (!no_modify)
+		unload_rtgroup_inodes(mp);
+
+	if (mp->m_sb.sb_rgcount > 0) {
+		if (!no_modify) {
+			error = -libxfs_rtginode_mkdir_parent(mp);
+			if (error)
+				do_error(_("failed to create realtime metadir (%d)\n"),
+					error);
+		}
+		mark_ino_inuse(mp, mp->m_rtdirip->i_ino, S_IFDIR,
+				mp->m_metadirip->i_ino);
+		mark_ino_metadata(mp, mp->m_rtdirip->i_ino);
+	}
+
+	/*
+	 * This isn't the whole story, but it keeps the message that we've had
+	 * for years and which is expected in xfstests and more.
+	 */
+	if (!no_modify)
+		do_log(
+_("        - resetting contents of realtime bitmap and summary inodes\n"));
+
+	if (mp->m_sb.sb_rgcount == 0)
+		return;
+
+	while ((rtg = xfs_rtgroup_next(mp, rtg))) {
+		ensure_rtgroup_bitmap(rtg);
+		ensure_rtgroup_summary(rtg);
+	}
+}
+
+static bool
+ensure_quota_file(
+	struct xfs_inode	*dp,
+	xfs_dqtype_t		type)
+{
+	struct xfs_mount	*mp = dp->i_mount;
+	struct xfs_inode	*ip;
+	const char		*name = libxfs_dqinode_path(type);
+	int			error;
+
+	if (!has_quota_inode(type))
+		return false;
+
+	if (no_modify) {
+		if (lost_quota_inode(type))
+			do_warn(_("would reset %s quota inode\n"), name);
+		return false;
+	}
+
+	if (!lost_quota_inode(type)) {
+		/*
+		 * The /quotas directory has been discarded, but we should
+		 * be able to iget the quota files directly.
+		 */
+		error = -libxfs_metafile_iget(mp, get_quota_inode(type),
+				xfs_dqinode_metafile_type(type), &ip);
+		if (error) {
+			do_warn(
+_("Could not open %s quota inode, error %d\n"),
+					name, error);
+			lose_quota_inode(type);
+		}
+	}
+
+	if (lost_quota_inode(type)) {
+		/*
+		 * The inode was bad or missing, state that we'll make a new
+		 * one even though we always create a new one.
+		 */
+		do_warn(_("resetting %s quota inode\n"), name);
+		error =  -libxfs_dqinode_metadir_create(dp, type, &ip);
+		if (error) {
+			do_warn(
+_("Couldn't create %s quota inode, error %d\n"),
+					name, error);
+			goto bad;
+		}
+	} else {
+		struct xfs_trans	*tp;
+
+		/* Erase parent pointers before we create the new link */
+		try_erase_parent_ptrs(ip);
+
+		error = -libxfs_dqinode_metadir_link(dp, type, ip);
+		if (error) {
+			do_warn(
+_("Couldn't link %s quota inode, error %d\n"),
+					name, error);
+			goto bad;
+		}
+
+		/*
+		 * Reset the link count to 1 because quota files are never
+		 * hardlinked, but the link above probably bumped it.
+		 */
+		error = -libxfs_trans_alloc_inode(ip, &M_RES(mp)->tr_ichange,
+				0, 0, false, &tp);
+		if (!error) {
+			set_nlink(VFS_I(ip), 1);
+			libxfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+			error = -libxfs_trans_commit(tp);
+		}
+		if (error)
+			do_error(
+_("Couldn't reset link count on %s quota inode, error %d\n"),
+					name, error);
+	}
+
+	/* Mark the inode in use. */
+	mark_ino_inuse(mp, ip->i_ino, S_IFREG, dp->i_ino);
+	mark_ino_metadata(mp, ip->i_ino);
+	libxfs_irele(ip);
+	return true;
+bad:
+	/* Zeroes qflags */
+	quotacheck_skip();
+	return false;
+}
+
+static void
+reset_quota_metadir_inodes(
+	struct xfs_mount	*mp)
+{
+	struct xfs_inode	*dp = NULL;
+	int			error;
+
+	error = -libxfs_dqinode_mkdir_parent(mp, &dp);
+	if (error)
+		do_error(_("failed to create quota metadir (%d)\n"),
+				error);
+
+	mark_ino_inuse(mp, dp->i_ino, S_IFDIR, mp->m_metadirip->i_ino);
+	mark_ino_metadata(mp, dp->i_ino);
+
+	ensure_quota_file(dp, XFS_DQTYPE_USER);
+	ensure_quota_file(dp, XFS_DQTYPE_GROUP);
+	ensure_quota_file(dp, XFS_DQTYPE_PROJ);
+	libxfs_irele(dp);
+}
+
 void
 phase6(xfs_mount_t *mp)
 {
@@ -3094,32 +3546,28 @@ phase6(xfs_mount_t *mp)
 		}
 	}
 
-	if (need_rbmino)  {
-		if (!no_modify)  {
-			do_warn(_("reinitializing realtime bitmap inode\n"));
-			mk_rbmino(mp);
-			need_rbmino = 0;
-		} else  {
-			do_warn(_("would reinitialize realtime bitmap inode\n"));
-		}
+	if (!no_modify && xfs_has_metadir(mp)) {
+		/*
+		 * In write mode, we always rebuild the metadata directory
+		 * tree, even if the old one was correct.  However, we still
+		 * want to log something if we couldn't find the old root.
+		 */
+		if (need_metadir_inode)
+			do_warn(_("reinitializing metadata root directory\n"));
+		mk_metadir(mp);
+		need_metadir_inode = false;
+		need_metadir_dotdot = 0;
+	} else if (need_metadir_inode) {
+		do_warn(_("would reinitialize metadata root directory\n"));
 	}
 
-	if (need_rsumino)  {
-		if (!no_modify)  {
-			do_warn(_("reinitializing realtime summary inode\n"));
-			mk_rsumino(mp);
-			need_rsumino = 0;
-		} else  {
-			do_warn(_("would reinitialize realtime summary inode\n"));
-		}
-	}
+	if (xfs_has_rtgroups(mp))
+		reset_rt_metadir_inodes(mp);
+	else
+		reset_rt_sb_inodes(mp);
 
-	if (!no_modify)  {
-		do_log(
-_("        - resetting contents of realtime bitmap and summary inodes\n"));
-		fill_rbmino(mp);
-		fill_rsumino(mp);
-	}
+	if (xfs_has_metadir(mp) && xfs_has_quota(mp) && !no_modify)
+		reset_quota_metadir_inodes(mp);
 
 	mark_standalone_inodes(mp);
 

@@ -761,12 +761,12 @@ mark_reflink_inodes(
 		agno = XFS_INO_TO_AGNO(mp, rciter.ino);
 		agino = XFS_INO_TO_AGINO(mp, rciter.ino);
 
-		pthread_mutex_lock(&ag_locks[agno].lock);
+		lock_ag(agno);
 		irec = find_inode_rec(mp, agno, agino);
 		off = get_inode_offset(mp, rciter.ino, irec);
 		/* lock here because we might go outside this ag */
 		set_inode_is_rl(irec, off);
-		pthread_mutex_unlock(&ag_locks[agno].lock);
+		unlock_ag(agno);
 	}
 	rcbag_ino_iter_stop(rcstack, &rciter);
 }
@@ -814,7 +814,7 @@ rmap_shareable(
 		return false;
 
 	/* Metadata in files are never shareable */
-	if (libxfs_internal_inum(mp, rmap->rm_owner))
+	if (libxfs_is_sb_inum(mp, rmap->rm_owner))
 		return false;
 
 	/* Metadata and unwritten file blocks are not shareable. */
@@ -1694,7 +1694,7 @@ xfs_extlen_t
 estimate_rmapbt_blocks(
 	struct xfs_perag	*pag)
 {
-	struct xfs_mount	*mp = pag->pag_mount;
+	struct xfs_mount	*mp = pag_mount(pag);
 	struct xfs_ag_rmap	*x;
 	unsigned long long	nr_recs = 0;
 
@@ -1707,12 +1707,12 @@ estimate_rmapbt_blocks(
 	 * means we can use SEEK_DATA/HOLE on the xfile, which is faster than
 	 * walking the entire btree to count records.
 	 */
-	x = &ag_rmaps[pag->pag_agno];
+	x = &ag_rmaps[pag_agno(pag)];
 	if (!rmaps_has_observations(x))
 		return 0;
 
 	nr_recs = xmbuf_bytes(x->ar_xmbtp) / sizeof(struct xfs_rmap_rec);
-	return libxfs_rmapbt_calc_size(pag->pag_mount, nr_recs);
+	return libxfs_rmapbt_calc_size(pag_mount(pag), nr_recs);
 }
 
 /* Estimate the size of the ondisk refcountbt from the incore data. */
@@ -1720,13 +1720,13 @@ xfs_extlen_t
 estimate_refcountbt_blocks(
 	struct xfs_perag	*pag)
 {
-	struct xfs_mount	*mp = pag->pag_mount;
+	struct xfs_mount	*mp = pag_mount(pag);
 	struct xfs_ag_rmap	*x;
 
 	if (!rmap_needs_work(mp) || !xfs_has_reflink(mp))
 		return 0;
 
-	x = &ag_rmaps[pag->pag_agno];
+	x = &ag_rmaps[pag_agno(pag)];
 	if (!x->ar_refcount_items)
 		return 0;
 

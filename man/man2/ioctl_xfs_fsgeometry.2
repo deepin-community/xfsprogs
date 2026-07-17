@@ -49,7 +49,8 @@ struct xfs_fsop_geom {
 
 	__u32         sick;
 	__u32         checked;
-	__u64         reserved[17];
+	__u64         rgextents;
+	__u64         reserved[16];
 };
 .fi
 .in
@@ -139,6 +140,9 @@ Please see the section
 .B XFS METADATA HEALTH REPORTING
 for more details.
 .PP
+.I rgextents
+Is the number of RT extents in each rtgroup.
+.PP
 .I reserved
 is set to zero.
 .SH FILESYSTEM FEATURE FLAGS
@@ -214,6 +218,9 @@ Filesystem supports sharing blocks between files.
 .TP
 .B XFS_FSOP_GEOM_FLAGS_EXCHANGE_RANGE
 Filesystem can exchange file contents atomically via XFS_IOC_EXCHANGE_RANGE.
+.TP
+.B XFS_FSOP_GEOM_FLAGS_METADIR
+Filesystem contains a metadata directory tree.
 .RE
 .SH XFS METADATA HEALTH REPORTING
 .PP

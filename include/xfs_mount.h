@@ -11,6 +11,7 @@ struct xfs_inode;
 struct xfs_buftarg;
 struct xfs_da_geometry;
 struct libxfs_init;
+struct xfs_group;
 
 typedef void (*buf_writeback_fn)(struct xfs_buf *bp);
 
@@ -24,6 +25,36 @@ enum {
 	XFS_LOWSP_MAX,
 };
 
+struct xfs_groups {
+	struct xarray		xa;
+
+	/*
+	 * Maximum capacity of the group in FSBs.
+	 *
+	 * Each group is laid out densely in the daddr space.  For the
+	 * degenerate case of a pre-rtgroups filesystem, the incore rtgroup
+	 * pretends to have a zero-block and zero-blklog rtgroup.
+	 */
+	uint32_t		blocks;
+
+	/*
+	 * Log(2) of the logical size of each group.
+	 *
+	 * Compared to the blocks field above this is rounded up to the next
+	 * power of two, and thus lays out the xfs_fsblock_t/xfs_rtblock_t
+	 * space sparsely with a hole from blocks to (1 << blklog) at the end
+	 * of each group.
+	 */
+	uint8_t			blklog;
+
+	/*
+	 * Mask to extract the group-relative block number from a FSB.
+	 * For a pre-rtgroups filesystem we pretend to have one very large
+	 * rtgroup, so this mask must be 64-bit.
+	 */
+	uint64_t		blkmask;
+};
+
 /*
  * Define a user-level mount structure with all we need
  * in order to make use of the numerous XFS_* macros.
@@ -33,6 +64,7 @@ typedef struct xfs_mount {
 #define m_icount	m_sb.sb_icount
 #define m_ifree		m_sb.sb_ifree
 #define m_fdblocks	m_sb.sb_fdblocks
+#define m_frextents	m_sb.sb_frextents
 	spinlock_t		m_sb_lock;
 
 	/*
@@ -51,15 +83,8 @@ typedef struct xfs_mount {
         struct xfs_ino_geometry	m_ino_geo;	/* inode geometry */
 	uint			m_rsumlevels;	/* rt summary levels */
 	xfs_filblks_t		m_rsumblocks;	/* size of rt summary, FSBs */
-	/*
-	 * Optional cache of rt summary level per bitmap block with the
-	 * invariant that m_rsum_cache[bbno] <= the minimum i for which
-	 * rsum[i][bbno] != 0. Reads and writes are serialized by the rsumip
-	 * inode lock.
-	 */
-	uint8_t			*m_rsum_cache;
-	struct xfs_inode	*m_rbmip;	/* pointer to bitmap inode */
-	struct xfs_inode	*m_rsumip;	/* pointer to summary inode */
+	struct xfs_inode	*m_metadirip;	/* ptr to metadata directory */
+	struct xfs_inode	*m_rtdirip;	/* ptr to realtime metadir */
 	struct xfs_buftarg	*m_ddev_targp;
 	struct xfs_buftarg	*m_logdev_targp;
 	struct xfs_buftarg	*m_rtdev_targp;
@@ -72,9 +97,11 @@ typedef struct xfs_mount {
 	uint8_t			m_sectbb_log;	/* sectorlog - BBSHIFT */
 	uint8_t			m_agno_log;	/* log #ag's */
 	int8_t			m_rtxblklog;	/* log2 of rextsize, if possible */
+
 	uint			m_blockmask;	/* sb_blocksize-1 */
 	uint			m_blockwsize;	/* sb_blocksize in words */
-	uint			m_blockwmask;	/* blockwsize-1 */
+	/* number of rt extents per rt bitmap block if rtgroups enabled */
+	unsigned int		m_rtx_per_rbmblock;
 	uint			m_alloc_mxr[2];	/* XFS_ALLOC_BLOCK_MAXRECS */
 	uint			m_alloc_mnr[2];	/* XFS_ALLOC_BLOCK_MINRECS */
 	uint			m_bmap_dmxr[2];	/* XFS_BMAP_BLOCK_DMAXRECS */
@@ -91,7 +118,7 @@ typedef struct xfs_mount {
 	xfs_extlen_t		m_ag_prealloc_blocks; /* reserved ag blocks */
 	uint			m_alloc_set_aside; /* space we can't use */
 	uint			m_ag_max_usable; /* max space per AG */
-	struct xarray		m_perags;
+	struct xfs_groups	m_groups[XG_TYPE_MAX];
 	uint64_t		m_features;	/* active filesystem features */
 	uint64_t		m_low_space[XFS_LOWSP_MAX];
 	uint64_t		m_rtxblkmask;	/* rt extent block mask */
@@ -170,6 +197,7 @@ typedef struct xfs_mount {
 #define XFS_FEAT_NEEDSREPAIR	(1ULL << 25)	/* needs xfs_repair */
 #define XFS_FEAT_NREXT64	(1ULL << 26)	/* large extent counters */
 #define XFS_FEAT_EXCHANGE_RANGE	(1ULL << 27)	/* exchange range */
+#define XFS_FEAT_METADIR	(1ULL << 28)	/* metadata directory tree */
 
 #define __XFS_HAS_FEAT(name, NAME) \
 static inline bool xfs_has_ ## name (struct xfs_mount *mp) \
@@ -215,6 +243,20 @@ __XFS_HAS_FEAT(bigtime, BIGTIME)
 __XFS_HAS_FEAT(needsrepair, NEEDSREPAIR)
 __XFS_HAS_FEAT(large_extent_counts, NREXT64)
 __XFS_HAS_FEAT(exchange_range, EXCHANGE_RANGE)
+__XFS_HAS_FEAT(metadir, METADIR)
+
+
+static inline bool xfs_has_rtgroups(struct xfs_mount *mp)
+{
+	/* all metadir file systems also allow rtgroups */
+	return xfs_has_metadir(mp);
+}
+
+static inline bool xfs_has_rtsb(struct xfs_mount *mp)
+{
+	/* all rtgroups filesystems with an rt section have an rtsb */
+	return xfs_has_rtgroups(mp) && xfs_has_realtime(mp);
+}
 
 /* Kernel mount features that we don't support */
 #define __XFS_UNSUPP_FEAT(name) \
@@ -235,6 +277,7 @@ __XFS_UNSUPP_FEAT(grpid)
 #define XFS_OPSTATE_DEBUGGER		1	/* is this the debugger? */
 #define XFS_OPSTATE_REPORT_CORRUPTION	2	/* report buffer corruption? */
 #define XFS_OPSTATE_PERAG_DATA_LOADED	3	/* per-AG data initialized? */
+#define XFS_OPSTATE_RTGROUP_DATA_LOADED	4	/* rtgroup data initialized? */
 
 #define __XFS_IS_OPSTATE(name, NAME) \
 static inline bool xfs_is_ ## name (struct xfs_mount *mp) \
@@ -260,6 +303,7 @@ __XFS_IS_OPSTATE(inode32, INODE32)
 __XFS_IS_OPSTATE(debugger, DEBUGGER)
 __XFS_IS_OPSTATE(reporting_corruption, REPORT_CORRUPTION)
 __XFS_IS_OPSTATE(perag_data_loaded, PERAG_DATA_LOADED)
+__XFS_IS_OPSTATE(rtgroup_data_loaded, RTGROUP_DATA_LOADED)
 
 #define __XFS_UNSUPP_OPSTATE(name) \
 static inline bool xfs_is_ ## name (struct xfs_mount *mp) \
@@ -298,12 +342,12 @@ struct xfs_defer_drain { /* empty */ };
 #define xfs_defer_drain_init(dr)		((void)0)
 #define xfs_defer_drain_free(dr)		((void)0)
 
-#define xfs_perag_intent_get(mp, agno) \
-	xfs_perag_get((mp), XFS_FSB_TO_AGNO((mp), (agno)))
-#define xfs_perag_intent_put(pag)		xfs_perag_put(pag)
+#define xfs_group_intent_get(mp, fsbno, type) \
+	xfs_group_get_by_fsb((mp), (fsbno), (type))
+#define xfs_group_intent_put(xg)		xfs_group_put(xg)
 
-static inline void xfs_perag_intent_hold(struct xfs_perag *pag) {}
-static inline void xfs_perag_intent_rele(struct xfs_perag *pag) {}
+static inline void xfs_group_intent_hold(struct xfs_group *xg) {}
+static inline void xfs_group_intent_rele(struct xfs_group *xg) {}
 
 static inline void libxfs_buftarg_drain(struct xfs_buftarg *btp)
 {

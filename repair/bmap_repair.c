@@ -104,7 +104,7 @@ xrep_bmap_check_fork_rmap(
 		return EFSCORRUPTED;
 
 	/* Check that this is within the AG. */
-	if (!xfs_verify_agbext(cur->bc_ag.pag, rec->rm_startblock,
+	if (!xfs_verify_agbext(to_perag(cur->bc_group), rec->rm_startblock,
 				rec->rm_blockcount))
 		return EFSCORRUPTED;
 
@@ -129,7 +129,6 @@ xrep_bmap_walk_rmap(
 	void				*priv)
 {
 	struct xrep_bmap		*rb = priv;
-	struct xfs_mount		*mp = cur->bc_mp;
 	xfs_fsblock_t			fsbno;
 	int				error;
 
@@ -155,8 +154,7 @@ xrep_bmap_walk_rmap(
 	    !(rec->rm_flags & XFS_RMAP_ATTR_FORK))
 		return 0;
 
-	fsbno = XFS_AGB_TO_FSB(mp, cur->bc_ag.pag->pag_agno,
-			rec->rm_startblock);
+	fsbno = libxfs_gbno_to_fsb(cur->bc_group, rec->rm_startblock);
 
 	if (rec->rm_flags & XFS_RMAP_BMBT_BLOCK) {
 		rb->old_bmbt_block_count += rec->rm_blockcount;
@@ -220,12 +218,11 @@ STATIC int
 xrep_bmap_find_mappings(
 	struct xrep_bmap	*rb)
 {
-	struct xfs_perag	*pag;
-	xfs_agnumber_t		agno;
+	struct xfs_perag	*pag = NULL;
 	int			error;
 
 	/* Iterate the rmaps for extents. */
-	for_each_perag(rb->sc->mp, agno, pag) {
+	while ((pag = xfs_perag_next(rb->sc->mp, pag))) {
 		error = xrep_bmap_scan_ag(rb, pag);
 		if (error) {
 			libxfs_perag_put(pag);
